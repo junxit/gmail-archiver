@@ -109,6 +109,7 @@ class BackupState:
         if 'last_backup_time' in data and data['last_backup_time']:
             state.last_backup_time = datetime.fromisoformat(data['last_backup_time'])
         
+        # Directly populate emails dict without using add_email to avoid double-counting
         for msg_id, meta_data in data.get('emails', {}).items():
             email_meta = EmailMetadata(
                 message_id=msg_id,
@@ -118,9 +119,9 @@ class BackupState:
                 backup_path=Path(meta_data['backup_path']) if meta_data.get('backup_path') else None,
                 size=meta_data.get('size')
             )
-            state.add_email(email_meta)
+            state.emails[msg_id] = email_meta
         
-        # Ensure all message IDs are in the backed_up_message_ids set
+        # Set backed_up_message_ids from data
         state.backed_up_message_ids = set(data.get('backed_up_message_ids', []))
         
         return state

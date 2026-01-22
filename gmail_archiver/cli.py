@@ -5,23 +5,40 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from google.oauth2.credentials import Credentials
 
 from . import __version__
-from .auth import get_gmail_credentials, get_imap_credentials
+from .auth import get_gmail_credentials, get_gmail_credentials_browser, get_imap_credentials
 from .backup import GmailBackup
 from .restore import GmailRestore
 from .utils import get_gmail_service, setup_logging
 
 logger = logging.getLogger(__name__)
 
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Gmail Archiver - Backup and restore Gmail emails with metadata.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Backup using browser-based authentication (easiest)
+  gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
+
+  # Backup using OAuth with custom credentials
+  gmail-archiver backup --auth-method oauth --client-secrets ~/credentials.json
+
+  # Backup using IMAP with app password
+  gmail-archiver backup --auth-method imap --email user@gmail.com --app-password xxxx
+
+  # Restore emails from backup
+  gmail-archiver restore --backup-dir ~/gmail-backup
+
+For more information, see: https://github.com/junxit/gmail-archiver
+"""
     )
     
     # Global arguments
@@ -107,9 +124,10 @@ def parse_args():
     
     auth_group.add_argument(
         '--auth-method',
-        choices=['oauth', 'imap'],
-        default='oauth',
-        help='Authentication method to use.'
+        choices=['oauth', 'browser', 'imap'],
+        default='browser',
+        help='Authentication method: oauth (requires client_secrets.json), '
+             'browser (opens browser for Google login), or imap (uses app password).'
     )
     
     # OAuth arguments
@@ -119,13 +137,13 @@ def parse_args():
         '--client-secrets',
         type=str,
         default='client_secrets.json',
-        help='Path to the OAuth client secrets file.'
+        help='Path to the OAuth client secrets file (for oauth method).'
     )
     
     oauth_group.add_argument(
         '--token',
         type=str,
-        default='token.json',
+        default='~/.gmail-archiver/token.json',
         help='Path to the OAuth token file.'
     )
     
@@ -153,75 +171,171 @@ def parse_args():
     
     return parser.parse_args()
 
-def get_credentials(args) -> Credentials:
-    """Get Gmail API credentials based on the authentication method."""
-    if args.auth_method == 'oauth':
-        # Expand the paths
-        client_secrets = os.path.expanduser(args.client_secrets)
-        token_path = os.path.expanduser(args.token)
+
+def get_credentials(args) -> Union[Credentials, object]:
+    """Get Gmail API credentials based on the authentication method.
+    
+    Args:
+        args: Parsed command-line arguments.
         
-        # Get OAuth credentials
-        return get_gmail_credentials(token_path, client_secrets)
-    else:
-        # Get IMAP credentials
-        if not args.email or not args.app_password:
-            logger.error("Email and app password are required for IMAP authentication.")
-            sys.exit(1)
+    Returns:
+        Credentials object for Gmail API or MailBox for IMAP.
+        
+    Raises:
+        SystemExit: If authentication fails.
+    """
+    try:
+        if args.auth_method == 'oauth':
+            # Traditional OAuth with client_secrets.json
+            client_secrets = os.path.expanduser(args.client_secrets)
+            token_path = os.path.expanduser(args.token)
+            return get_gmail_credentials(token_path, client_secrets)
+        
+        elif args.auth_method == 'browser':
+            # Browser-based OAuth (uses bundled or user credentials)
+            token_path = os.path.expanduser(args.token)
             
-        return get_imap_credentials(
-            email=args.email,
-            app_password=args.app_password,
-            imap_server=args.imap_server
-        )
+            # Check if user has a client_secrets file
+            client_secrets_path = Path(args.client_secrets).expanduser()
+            if client_secrets_path.exists():
+                logger.info(f"Using custom credentials from {client_secrets_path}")
+                return get_gmail_credentials(token_path, str(client_secrets_path))
+            else:
+                # Use browser flow with bundled credentials
+                return get_gmail_credentials_browser(token_path=token_path)
+        
+        else:  # imap
+            if not args.email:
+                logger.error("Email address is required for IMAP authentication. Use --email")
+                sys.exit(1)
+            if not args.app_password:
+                logger.error("App password is required for IMAP authentication. Use --app-password")
+                sys.exit(1)
+            
+            return get_imap_credentials(
+                email=args.email,
+                app_password=args.app_password,
+                imap_server=args.imap_server
+            )
+            
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Authentication failed: {e}")
+        if args.log_level == 'DEBUG':
+            logger.exception("Full traceback:")
+        sys.exit(1)
+
+
+def get_state_file(args, command: str) -> Path:
+    """Get the state file path, creating default if not specified.
+    
+    Args:
+        args: Parsed command-line arguments.
+        command: The command being executed ('backup' or 'restore').
+        
+    Returns:
+        Path to the state file.
+    """
+    if args.state_file:
+        return Path(args.state_file).expanduser().resolve()
+    
+    # Default state file in backup directory
+    backup_dir = Path(args.backup_dir).expanduser().resolve()
+    return backup_dir / f'{command}_state.json'
+
 
 def main() -> None:
     """Main entry point for the CLI."""
     args = parse_args()
     setup_logging(args.log_level)
     
+    logger.debug(f"Gmail Archiver {__version__}")
+    logger.debug(f"Command: {args.command}")
+    logger.debug(f"Auth method: {args.auth_method}")
+    
     try:
+        # Expand backup directory path
+        backup_dir = Path(args.backup_dir).expanduser().resolve()
+        
         if args.command == 'backup':
-            # Get Gmail API service
+            # Get credentials (OAuth or browser flow)
+            if args.auth_method == 'imap':
+                logger.error("IMAP authentication is not yet fully supported for backup. Please use oauth or browser.")
+                sys.exit(1)
+            
             credentials = get_credentials(args)
             service = get_gmail_service(credentials)
+            
+            # Get state file path
+            state_file = get_state_file(args, 'backup')
             
             # Initialize backup
             backup = GmailBackup(
                 gmail_service=service,
-                backup_dir=args.backup_dir,
-                state_file=args.state_file,
+                backup_dir=backup_dir,
+                state_file=state_file,
                 batch_size=args.batch_size,
-                log_level=args.log_level
             )
             
             # Run backup
+            logger.info(f"Starting backup to {backup_dir}")
             result = backup.backup_emails(max_results=args.max_results)
-            logger.info("Backup completed: %s", json.dumps(result, indent=2))
+            
+            print("\n" + "="*60)
+            print("BACKUP COMPLETE")
+            print("="*60)
+            print(f"  Emails processed: {result['total_processed']}")
+            print(f"  Errors: {result['total_errors']}")
+            print(f"  Backup location: {backup_dir}")
+            print("="*60)
             
         elif args.command == 'restore':
-            # Get Gmail API service
+            # Get credentials
+            if args.auth_method == 'imap':
+                logger.error("IMAP authentication is not supported for restore. Please use oauth or browser.")
+                sys.exit(1)
+            
             credentials = get_credentials(args)
             service = get_gmail_service(credentials)
+            
+            # Get state file path
+            state_file = get_state_file(args, 'restore')
             
             # Initialize restore
             restore = GmailRestore(
                 gmail_service=service,
-                backup_dir=args.backup_dir,
-                state_file=args.state_file,
+                backup_dir=str(backup_dir),
+                state_file=str(state_file),
                 batch_size=args.batch_size,
                 log_level=args.log_level
             )
             
             # Run restore
+            logger.info(f"Starting restore from {backup_dir}")
             result = restore.restore_emails(max_results=args.max_results)
-            logger.info("Restore completed: %s", json.dumps(result, indent=2))
+            
+            print("\n" + "="*60)
+            print("RESTORE COMPLETE")
+            print("="*60)
+            print(f"  Emails restored: {result['total_restored']}")
+            print(f"  Errors: {result['total_errors']}")
+            print("="*60)
             
     except KeyboardInterrupt:
+        print("\n")
         logger.info("Operation cancelled by user.")
-        sys.exit(1)
+        sys.exit(130)
     except Exception as e:
-        logger.error("An error occurred: %s", e, exc_info=args.log_level == 'DEBUG')
+        logger.error(f"An error occurred: {e}")
+        if args.log_level == 'DEBUG':
+            logger.exception("Full traceback:")
         sys.exit(1)
+
 
 if __name__ == '__main__':
     main()

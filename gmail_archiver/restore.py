@@ -3,7 +3,7 @@ import base64
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -209,7 +209,17 @@ class GmailRestore:
             # Process in batches
             total_processed = 0
             total_errors = 0
-            batch_size = min(self.batch_size, len(metadata_files))
+            
+            # Handle empty case
+            if not metadata_files:
+                logger.info("No emails to restore")
+                return {
+                    'total_restored': 0,
+                    'total_errors': 0,
+                    'last_restore_time': None
+                }
+            
+            batch_size = min(self.batch_size, len(metadata_files)) if metadata_files else 1
             
             for i in range(0, len(metadata_files), batch_size):
                 batch = metadata_files[i:i + batch_size]
@@ -219,7 +229,7 @@ class GmailRestore:
                 total_errors += errors
                 
                 # Update the state
-                self.state['last_restore_time'] = datetime.now().isoformat()
+                self.state['last_restore_time'] = datetime.now(timezone.utc).isoformat()
                 self.state['total_restored'] = total_processed
                 self.state['total_errors'] = total_errors
                 

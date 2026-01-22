@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from googleapiclient.discovery import Resource
 from googleapiclient.errors import HttpError
@@ -55,17 +55,17 @@ class GmailBackup:
         self.emails_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
     
-    def _load_state(self) -> Dict[str, Any]:
+    def _load_state(self) -> BackupState:
         """Load the backup state from the state file."""
         if not self.state_file.exists():
-            return {}
+            return BackupState()
         try:
             with open(self.state_file, 'r', encoding='utf-8') as f:
-                state = json.load(f)
-                return state if isinstance(state, dict) else {}
+                data = json.load(f)
+                return BackupState.from_dict(data) if isinstance(data, dict) else BackupState()
         except (IOError, json.JSONDecodeError) as e:
             logger.warning(f"Error loading backup state: {e}")
-            return {}
+            return BackupState()
     
     def _save_state(self) -> None:
         """Save the current backup state to the state file."""
@@ -73,8 +73,8 @@ class GmailBackup:
             # Ensure the directory exists
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.state_file, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, indent=2, ensure_ascii=False, default=str)
-        except (IOError, json.JSONEncodeError) as e:
+                json.dump(self.state.to_dict(), f, indent=2, ensure_ascii=False, default=str)
+        except (IOError, TypeError) as e:
             logger.error(f"Error saving backup state: {e}")
             raise
     
@@ -88,7 +88,7 @@ class GmailBackup:
             The email message as a dictionary, or None if not found.
         """
         try:
-            message = self.service.users().messages().get(
+            message = self.gmail.users().messages().get(
                 userId='me',
                 id=msg_id,
                 format='raw'
@@ -138,10 +138,10 @@ class GmailBackup:
             metadata = {
                 'message_id': msg_id,
                 'thread_id': email_data.get('threadId'),
-                'subject': msg.get('subject'),
-                'from_': msg.get('from_'),
-                'to': msg.get('to'),
-                'date': msg.get('date'),
+                'subject': msg.get('Subject', 'no-subject'),
+                'from': msg.get('From', ''),
+                'to': msg.get('To', ''),
+                'date': msg.get('Date', ''),
                 'labels': labels,
                 'internal_date': email_data.get('internalDate'),
                 'size': len(msg_str),
@@ -151,7 +151,6 @@ class GmailBackup:
             
             metadata_path = self.metadata_dir / f"{msg_id}.json"
             with open(metadata_path, 'w', encoding='utf-8') as f:
-                import json
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
             
             return email_path
@@ -226,11 +225,18 @@ class GmailBackup:
         logger.info("Starting Gmail backup to: %s", self.backup_dir)
         
         try:
+            # Build query for incremental backup
+            query = None
+            if self.state.last_backup_time:
+                # Convert datetime to Unix timestamp for Gmail query
+                timestamp = int(self.state.last_backup_time.timestamp())
+                query = f"after:{timestamp}"
+            
             # Get the list of all messages
             request = self.gmail.users().messages().list(
                 userId='me',
                 maxResults=self.batch_size,
-                q=f"after:{int(self.state.get('last_backup_time', 0))}" if self.state.get('last_backup_time') else None
+                q=query
             )
             
             total_processed = 0
@@ -252,8 +258,8 @@ class GmailBackup:
                 total_errors += errors
                 
                 # Update the state
-                self.state['last_backup_time'] = datetime.now(timezone.utc).isoformat()
-                self.state['last_backup_count'] = total_processed
+                self.state.last_backup_time = datetime.now(timezone.utc)
+                self.state.last_backup_count = total_processed
                 
                 # Save the state after each batch
                 self._save_state()
@@ -274,21 +280,17 @@ class GmailBackup:
                 ) if 'nextPageToken' in response else None
                 
             # Calculate total size of all emails
-            total_size = sum(
-                email.get('size', 0) 
-                for email in self.state.get('emails', {}).values()
-            )
+            total_size = self.state.total_backup_size
             
             logger.info(
-                "Backup completed. Total processed: %d, errors: %d, total size: %s",
-                total_processed, total_errors, total_size
+                f"Backup completed. Total processed: {total_processed}, errors: {total_errors}, total size: {format_size(total_size)}"
             )
             
             return {
                 'total_processed': total_processed,
                 'total_errors': total_errors,
                 'emails_processed': total_processed,
-                'last_backup_time': self.state.get('last_backup_time')
+                'last_backup_time': self.state.last_backup_time.isoformat() if self.state.last_backup_time else None
             }
             
         except Exception as e:

@@ -17,11 +17,11 @@
     <a href="https://pypi.org/project/gmail-archiver/">
       <img alt="PyPI" src="https://img.shields.io/pypi/v/gmail-archiver">
     </a>
-    <a href="https://github.com/yourusername/gmail-archiver/actions/workflows/tests.yml">
-      <img alt="Tests" src="https://github.com/yourusername/gmail-archiver/actions/workflows/tests.yml/badge.svg">
+    <a href="https://github.com/junxit/gmail-archiver/actions/workflows/tests.yml">
+      <img alt="Tests" src="https://github.com/junxit/gmail-archiver/actions/workflows/tests.yml/badge.svg">
     </a>
-    <a href="https://codecov.io/gh/yourusername/gmail-archiver">
-      <img alt="Codecov" src="https://codecov.io/gh/yourusername/gmail-archiver/branch/main/graph/badge.svg">
+    <a href="https://codecov.io/gh/junxit/gmail-archiver">
+      <img alt="Codecov" src="https://codecov.io/gh/junxit/gmail-archiver/branch/main/graph/badge.svg">
     </a>
     <a href="https://github.com/psf/black">
       <img alt="Code style: black" src="https://img.shields.io/badge/code%20style-black-000000.svg">
@@ -36,7 +36,7 @@ Gmail Archiver is a powerful command-line tool that allows you to:
 - **Migrate** emails between accounts
 - **Archive** important communications for compliance or record-keeping
 
-The tool supports both OAuth 2.0 and IMAP authentication methods and is designed to handle large mailboxes efficiently with incremental backups and resumable operations.
+The tool supports multiple authentication methods including browser-based OAuth, traditional OAuth 2.0, and IMAP with app passwords.
 
 ## ✨ Features
 
@@ -56,9 +56,9 @@ The tool supports both OAuth 2.0 and IMAP authentication methods and is designed
   - **Batch Processing** - Process emails in configurable batches
 
 - **Flexible Authentication**
-  - OAuth 2.0 (recommended)
+  - Browser-based OAuth (easiest - no setup required)
+  - OAuth 2.0 with custom credentials
   - IMAP with App Password
-  - Configurable credentials management
 
 - **Advanced Features**
   - Filter emails by date range, labels, or search queries
@@ -74,86 +74,117 @@ The tool supports both OAuth 2.0 and IMAP authentication methods and is designed
 
 - **Google Account**
   - A Gmail account with sufficient storage
-  - For OAuth: Access to Google Cloud Console
+  - For OAuth: Access to Google Cloud Console (optional)
   - For IMAP: 2-Step Verification enabled
-
-- **Dependencies**
-  - [Google API Client](https://developers.google.com/gmail/api/quickstart/python)
-  - [IMAP Client](https://pypi.org/project/imap-tools/)
-  - Other dependencies are listed in `requirements.txt`
 
 ## 🚀 Installation
 
-### For Homebrew Python Users
+### Using uv (Recommended)
 
-If you're using Python installed via Homebrew (which is managed externally), follow these steps:
-
-1. **Create a virtual environment** (recommended):
-   ```bash
-   # Create a virtual environment in the project directory
-   python3 -m venv .venv
-   
-   # Activate the virtual environment
-   # On macOS/Linux:
-   source .venv/bin/activate
-   # On Windows:
-   # .venv\Scripts\activate
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   # Install the package in development mode
-   pip install -e .
-   
-   # Or install directly with all dependencies
-   pip install -r requirements.txt
-   ```
-
-### Using pip (Global Installation)
-
-If you prefer a global installation (not recommended):
+[uv](https://github.com/astral-sh/uv) is a fast Python package manager. If you don't have it installed:
 
 ```bash
-# Install directly from PyPI
+# Install uv (macOS/Linux)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Or with Homebrew
+brew install uv
+```
+
+Then install Gmail Archiver:
+
+```bash
+# Create a virtual environment and install
+uv venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install -e .
+
+# Or install dependencies only
+uv pip install -r requirements.txt
+```
+
+### Using pip
+
+```bash
+# Create a virtual environment (recommended)
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install the package in development mode
+pip install -e .
+
+# Or install directly with all dependencies
+pip install -r requirements.txt
+```
+
+### From PyPI
+
+```bash
+# Using uv
+uv pip install gmail-archiver
+
+# Using pip
 pip install gmail-archiver
 ```
 
-### From Source (Alternative Method)
+### From Source
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/gmail-archiver.git
+   git clone https://github.com/junxit/gmail-archiver.git
    cd gmail-archiver
    ```
 
-2. **Set up a virtual environment** (recommended)
+2. **Set up virtual environment and install**
+   
+   Using uv:
    ```bash
-   # Create and activate virtual environment
-   python -m venv venv
-   
-   # On Windows
-   .\venv\Scripts\activate
-   
-   # On macOS/Linux
-   source venv/bin/activate
+   uv venv .venv
+   source .venv/bin/activate
+   uv pip install -e .
    ```
-
-3. **Install dependencies**
+   
+   Using pip:
    ```bash
-   pip install -r requirements.txt
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   pip install -e .
    ```
 
 ### Verify Installation
 
 ```bash
+# Using the installed command
 gmail-archiver --version
-# or
+
+# Or run directly with Python
 python -m gmail_archiver.cli --version
+
+# Or with uv (no activation needed)
+uv run gmail-archiver --version
 ```
 
 ## 🔐 Authentication
 
-### Option A: OAuth 2.0 (Recommended)
+Gmail Archiver supports three authentication methods:
+
+### Option A: Browser-Based OAuth (Easiest)
+
+This is the simplest option - just run the command and a browser window will open for you to sign in:
+
+```bash
+gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
+```
+
+- ✅ No Google Cloud Console setup required
+- ✅ Opens browser for secure Google login
+- ✅ Tokens are saved for future use
+
+> **Note:** If you have a `client_secrets.json` file in your directory, it will be used automatically. Otherwise, you'll need to set up your own OAuth credentials (see Option B).
+
+### Option B: OAuth 2.0 with Custom Credentials
+
+For more control or organizational use, set up your own OAuth credentials:
 
 1. **Create a Google Cloud Project**
    - Go to [Google Cloud Console](https://console.cloud.google.com/)
@@ -176,7 +207,14 @@ python -m gmail_archiver.cli --version
    - Select "Desktop app" as the application type
    - Download the JSON file and save it as `client_secrets.json`
 
-### Option B: IMAP (App Password)
+5. **Run with OAuth**
+   ```bash
+   gmail-archiver backup --auth-method oauth --client-secrets client_secrets.json --backup-dir ~/gmail-backup
+   ```
+
+### Option C: IMAP (App Password)
+
+Use IMAP authentication with a Google App Password:
 
 1. **Enable 2-Step Verification**
    - Go to your [Google Account Security](https://myaccount.google.com/security)
@@ -188,6 +226,11 @@ python -m gmail_archiver.cli --version
    - Select "Mail" and "Other (Custom name)"
    - Enter "Gmail Archiver" as the name
    - Click "Generate" and copy the 16-character password
+
+3. **Run with IMAP**
+   ```bash
+   gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" --backup-dir ~/gmail-backup
+   ```
 
 ### Environment Variables (Optional)
 
@@ -209,24 +252,27 @@ export GMAIL_ARCHIVER_APP_PASSWORD=your_app_password
 #### Backup Emails
 
 ```bash
-# Basic backup (OAuth)
-gmail-archiver backup --backup-dir ~/gmail-backup
+# Browser-based authentication (easiest)
+gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
+
+# Using OAuth with custom credentials
+gmail-archiver backup --auth-method oauth --client-secrets ~/credentials.json --backup-dir ~/gmail-backup
 
 # Using IMAP
-gmail-archiver backup --backup-dir ~/gmail-backup --auth-method imap --email your.email@example.com
+gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx" --backup-dir ~/gmail-backup
 
-# Backup with progress display
-gmail-archiver backup --backup-dir ~/gmail-backup --progress
+# With uv (no virtual environment activation needed)
+uv run gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
 ```
 
 #### Restore Emails
 
 ```bash
-# Basic restore (OAuth)
+# Restore from backup
 gmail-archiver restore --backup-dir ~/gmail-backup
 
-# Restore to a different label
-gmail-archiver restore --backup-dir ~/gmail-backup --label "Restored Emails"
+# With uv
+uv run gmail-archiver restore --backup-dir ~/gmail-backup
 ```
 
 ### Advanced Usage
@@ -234,102 +280,58 @@ gmail-archiver restore --backup-dir ~/gmail-backup --label "Restored Emails"
 #### Backup Options
 
 ```bash
-# Backup specific labels only
-gmail-archiver backup --backup-dir ~/gmail-backup --labels "INBOX,SENT"
-
-# Backup emails after a specific date
-gmail-archiver backup --backup-dir ~/gmail-backup --after "2023-01-01"
+# Limit number of emails to backup
+gmail-archiver backup --backup-dir ~/gmail-backup --max-results 100
 
 # Custom batch size for large mailboxes
 gmail-archiver backup --backup-dir ~/gmail-backup --batch-size 50
 
-# Exclude specific labels
-gmail-archiver backup --backup-dir ~/gmail-backup --exclude-labels "TRASH,SPAM"
+# Enable debug logging
+gmail-archiver --log-level DEBUG backup --backup-dir ~/gmail-backup
 ```
 
 #### Restore Options
 
 ```bash
-# Dry run (show what would be restored)
-gmail-archiver restore --backup-dir ~/gmail-backup --dry-run
+# Limit number of emails to restore
+gmail-archiver restore --backup-dir ~/gmail-backup --max-results 50
 
-# Restore only specific labels
-gmail-archiver restore --backup-dir ~/gmail-backup --labels "IMPORTANT,PROJECTS"
-
-# Skip existing emails
-gmail-archiver restore --backup-dir ~/gmail-backup --skip-existing
+# Custom batch size
+gmail-archiver restore --backup-dir ~/gmail-backup --batch-size 5
 ```
 
-### Configuration File
-
-Create a `config.ini` file in your backup directory:
-
-```ini
-[backup]
-directory = /path/to/backup
-batch_size = 50
-state_file = /path/to/state.json
-
-[oauth]
-client_secrets = /path/to/client_secrets.json
-
-[imap]
-email = your.email@example.com
-app_password = your_app_password
-```
-
-Then use it with:
-
-```bash
-gmail-archiver --config /path/to/config.ini backup
-```
-
-## 🔄 Backup Format
+## � Backup Format
 
 The backup directory structure is organized as follows:
 
 ```
 backup-dir/
-├── emails/                 # Raw .eml files
-│   ├── 2023/
-│   │   ├── 01/
-│   │   │   ├── 01/
-│   │   │   │   ├── abc123.eml
-│   │   │   │   └── def456.eml
-│   │   │   └── ...
-│   │   └── ...
-│   └── ...
-├── metadata/              # JSON metadata files
-│   ├── emails.json        # Index of all emails
-│   └── state.json         # Backup state and progress
-└── logs/                  # Log files
-    └── backup_20230101_120000.log
+├── emails/                 # Raw .eml files organized by date
+│   └── YYYY/
+│       └── MM/
+│           └── MESSAGE_ID_HASH_SUBJECT.eml
+├── metadata/               # JSON metadata files
+│   └── MESSAGE_ID.json
+├── backup_state.json       # Backup progress and state
+└── restore_state.json      # Restore progress (if restored)
 ```
 
 ### Metadata Format
 
-Each email's metadata is stored in `emails.json` with the following structure:
+Each email's metadata is stored as a JSON file:
 
 ```json
 {
-  "emails": {
-    "<message_id>": {
-      "id": "<message_id>",
-      "thread_id": "<thread_id>",
-      "subject": "Email Subject",
-      "from": "sender@example.com",
-      "to": ["recipient@example.com"],
-      "date": "2023-01-01T12:00:00Z",
-      "labels": ["INBOX", "IMPORTANT"],
-      "size": 1024,
-      "backup_path": "emails/2023/01/01/abc123.eml"
-    }
-  },
-  "stats": {
-    "total_emails": 1,
-    "total_size": 1024,
-    "last_backup_time": "2023-01-01T12:00:00Z"
-  }
+  "message_id": "<message_id>",
+  "thread_id": "<thread_id>",
+  "subject": "Email Subject",
+  "from": "sender@example.com",
+  "to": "recipient@example.com",
+  "date": "Mon, 1 Jan 2024 12:00:00 +0000",
+  "labels": ["INBOX", "IMPORTANT"],
+  "size": 1024,
+  "backup_path": "emails/2024/01/abc123.eml",
+  "backup_time": "2024-01-01T12:00:00Z"
 }
 ```
 
@@ -338,6 +340,7 @@ Each email's metadata is stored in `emails.json` with the following structure:
 ### Common Issues
 
 1. **Authentication Errors**
+   - For browser auth: Ensure you complete the Google sign-in in the browser
    - For OAuth: Ensure `client_secrets.json` is in the correct location
    - For IMAP: Verify 2-Step Verification is enabled and app password is correct
    - Check that the Gmail API is enabled in Google Cloud Console
@@ -345,23 +348,40 @@ Each email's metadata is stored in `emails.json` with the following structure:
 2. **Rate Limiting**
    - Google has rate limits for API and IMAP access
    - Use `--batch-size` to reduce the number of requests
-   - Add delays between batches with `--delay`
+   - Add delays between batches if needed
 
 3. **Large Attachments**
    - For large mailboxes, use `--batch-size` to process in smaller chunks
-   - Consider using `--max-size` to limit attachment sizes
+   - Consider using `--max-results` to limit the scope
 
 ### Viewing Logs
 
-Logs are stored in the `logs` directory by default. You can also enable verbose logging:
+Enable verbose logging for debugging:
 
 ```bash
 gmail-archiver --log-level DEBUG backup --backup-dir ~/gmail-backup
 ```
 
+## � Testing
+
+Run the test suite:
+
+```bash
+# Using uv
+uv run pytest --cov=gmail_archiver tests/
+
+# Using pip
+pip install pytest pytest-cov
+pytest --cov=gmail_archiver tests/
+
+# Run specific test files
+pytest tests/test_backup.py -v
+pytest tests/test_restore.py -v
+```
+
 ## 🤝 Contributing
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details on how to submit pull requests, report bugs, or suggest new features.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
@@ -376,58 +396,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙏 Acknowledgments
 
 - [Google Gmail API](https://developers.google.com/gmail/api)
-- [IMAP Tools](https://pypi.org/project/imap-tools/)
-- [Click](https://click.palletsprojects.com/) for the CLI framework
-- `--batch-size`: Number of emails to restore in each batch (default: 10)
-- `--state-file`: Custom path to the restore state file
-
-#### Authentication Options
-
-- `--auth-method`: Authentication method to use (`oauth` or `imap`)
-- `--client-secrets`: Path to OAuth client secrets file (default: `client_secrets.json`)
-- `--token`: Path to OAuth token file (default: `token.json`)
-- `--email`: Email address for IMAP authentication
-- `--app-password`: App password for IMAP authentication
-- `--imap-server`: IMAP server address (default: `imap.gmail.com`)
-
-## Backup File Structure
-
-The backup directory will have the following structure:
-
-```
-backup-dir/
-├── backup_state.json      # Backup state information
-├── emails/               # Email files (.eml)
-│   ├── YYYY/
-│   │   └── MM/
-│   │       └── MESSAGE_ID_HASH_SUBJECT.eml
-├── metadata/             # Email metadata (.json)
-│   └── MESSAGE_ID.json
-└── restore_state.json    # Restore state information (if restored)
-```
-
-## Testing
-
-To run the test suite:
-
-```bash
-# Install test dependencies
-pip install pytest pytest-cov
-
-# Run tests
-pytest --cov=gmail_archiver tests/
-```
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Acknowledgments
-
-- [Google Gmail API](https://developers.google.com/gmail/api)
 - [python-imap-tools](https://github.com/ikvk/imap_tools)
 - [Google API Python Client](https://github.com/googleapis/google-api-python-client)
+- [uv](https://github.com/astral-sh/uv) - Fast Python package manager
