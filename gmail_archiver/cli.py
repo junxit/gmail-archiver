@@ -19,8 +19,99 @@ from .utils import get_gmail_service, setup_logging
 logger = logging.getLogger(__name__)
 
 
-def parse_args():
-    """Parse command-line arguments."""
+def _add_shared_arguments(target, use_suppress_defaults=False):
+    """Add the options shared by every subcommand to ``target``.
+
+    These options are registered on both the top-level parser and a parent
+    parser inherited by the subcommands, so each can be supplied either before
+    or after the subcommand (both ``--backup-dir X backup`` and
+    ``backup --backup-dir X`` work).
+
+    Args:
+        target: The ``ArgumentParser`` to add the arguments to.
+        use_suppress_defaults: When True, every option defaults to
+            ``argparse.SUPPRESS`` so that, on the subcommand parser, an absent
+            option does not overwrite a value parsed before the subcommand. The
+            top-level parser supplies the real defaults instead.
+    """
+    def default(real_default):
+        return argparse.SUPPRESS if use_suppress_defaults else real_default
+
+    target.add_argument(
+        '--backup-dir',
+        type=str,
+        default=default('~/gmail-backup'),
+        help='Directory to store backup files.'
+    )
+
+    target.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        default=default('INFO'),
+        help='Set the logging level.'
+    )
+
+    auth_group = target.add_argument_group('Authentication')
+    auth_group.add_argument(
+        '--auth-method',
+        choices=['oauth', 'browser', 'imap'],
+        default=default('browser'),
+        help='Authentication method: oauth (requires client_secrets.json), '
+             'browser (opens browser for Google login), or imap (uses app password).'
+    )
+
+    oauth_group = target.add_argument_group('OAuth Authentication')
+    oauth_group.add_argument(
+        '--client-secrets',
+        type=str,
+        default=default('client_secrets.json'),
+        help='Path to the OAuth client secrets file (for oauth method).'
+    )
+    oauth_group.add_argument(
+        '--token',
+        type=str,
+        default=default('~/.gmail-archiver/token.json'),
+        help='Path to the OAuth token file.'
+    )
+
+    imap_group = target.add_argument_group('IMAP Authentication')
+    imap_group.add_argument(
+        '--email',
+        type=str,
+        default=default(None),
+        help='Email address for IMAP authentication.'
+    )
+    imap_group.add_argument(
+        '--app-password',
+        type=str,
+        default=default(None),
+        help='App password for IMAP authentication.'
+    )
+    imap_group.add_argument(
+        '--imap-server',
+        type=str,
+        default=default('imap.gmail.com'),
+        help='IMAP server address.'
+    )
+    imap_group.add_argument(
+        '--folder',
+        type=str,
+        default=default('[Gmail]/All Mail'),
+        help='IMAP folder to back up (imap method only). Defaults to all '
+             'archived mail; the exact name may vary by account language.'
+    )
+
+
+def parse_args(argv=None):
+    """Parse command-line arguments.
+
+    Args:
+        argv: Optional list of argument strings (defaults to ``sys.argv``).
+            Exposed primarily for testing.
+
+    Returns:
+        The parsed argument namespace.
+    """
     parser = argparse.ArgumentParser(
         description="Gmail Archiver - Backup and restore Gmail emails with metadata.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -49,82 +140,15 @@ For more information, see: https://github.com/junxit/gmail-archiver
         version=f'%(prog)s {__version__}'
     )
 
-    # Options shared by every subcommand live on a parent parser so they are
-    # accepted *after* the subcommand (e.g. `backup --auth-method imap
-    # --backup-dir ...`), which is the form used throughout the docs.
+    # Shared options are registered on BOTH the top-level parser (with real
+    # defaults) and a parent parser inherited by the subcommands (with
+    # suppressed defaults, so an option absent after the subcommand does not
+    # clobber a value supplied before it). This lets every global option be
+    # passed either before or after the subcommand.
+    _add_shared_arguments(parser, use_suppress_defaults=False)
+
     common = argparse.ArgumentParser(add_help=False)
-
-    common.add_argument(
-        '--backup-dir',
-        type=str,
-        default='~/gmail-backup',
-        help='Directory to store backup files.'
-    )
-
-    common.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-        default='INFO',
-        help='Set the logging level.'
-    )
-
-    # Authentication arguments
-    auth_group = common.add_argument_group('Authentication')
-
-    auth_group.add_argument(
-        '--auth-method',
-        choices=['oauth', 'browser', 'imap'],
-        default='browser',
-        help='Authentication method: oauth (requires client_secrets.json), '
-             'browser (opens browser for Google login), or imap (uses app password).'
-    )
-
-    # OAuth arguments
-    oauth_group = common.add_argument_group('OAuth Authentication')
-
-    oauth_group.add_argument(
-        '--client-secrets',
-        type=str,
-        default='client_secrets.json',
-        help='Path to the OAuth client secrets file (for oauth method).'
-    )
-
-    oauth_group.add_argument(
-        '--token',
-        type=str,
-        default='~/.gmail-archiver/token.json',
-        help='Path to the OAuth token file.'
-    )
-
-    # IMAP arguments
-    imap_group = common.add_argument_group('IMAP Authentication')
-
-    imap_group.add_argument(
-        '--email',
-        type=str,
-        help='Email address for IMAP authentication.'
-    )
-
-    imap_group.add_argument(
-        '--app-password',
-        type=str,
-        help='App password for IMAP authentication.'
-    )
-
-    imap_group.add_argument(
-        '--imap-server',
-        type=str,
-        default='imap.gmail.com',
-        help='IMAP server address.'
-    )
-
-    imap_group.add_argument(
-        '--folder',
-        type=str,
-        default='[Gmail]/All Mail',
-        help='IMAP folder to back up (imap method only). Defaults to all '
-             'archived mail; the exact name may vary by account language.'
-    )
+    _add_shared_arguments(common, use_suppress_defaults=True)
 
     # Subcommands (each inherits the shared options via parents=[common]).
     subparsers = parser.add_subparsers(
@@ -185,7 +209,7 @@ For more information, see: https://github.com/junxit/gmail-archiver
         help='Path to the restore state file.'
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def get_credentials(args) -> Union[Credentials, object]:

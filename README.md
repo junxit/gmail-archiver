@@ -284,6 +284,13 @@ export GMAIL_ARCHIVER_APP_PASSWORD=your_app_password
 
 ## 💻 Usage
 
+> **Flexible argument order:** global options (`--auth-method`, `--backup-dir`,
+> `--email`, `--app-password`, `--folder`, `--log-level`, …) may be given either
+> before or after the `backup`/`restore` subcommand — e.g.
+> `gmail-archiver backup --auth-method imap …` and
+> `gmail-archiver --auth-method imap … backup` are equivalent. The examples below
+> place them after the subcommand.
+
 ### Basic Commands
 
 #### Backup Emails
