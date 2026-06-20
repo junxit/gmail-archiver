@@ -12,6 +12,7 @@ from google.oauth2.credentials import Credentials
 from . import __version__
 from .auth import get_gmail_credentials, get_gmail_credentials_browser, get_imap_credentials
 from .backup import GmailBackup
+from .imap_backup import ImapBackup
 from .restore import GmailRestore
 from .utils import get_gmail_service, setup_logging
 
@@ -41,87 +42,35 @@ For more information, see: https://github.com/junxit/gmail-archiver
 """
     )
     
-    # Global arguments
+    # Top-level only argument.
     parser.add_argument(
         '--version',
         action='version',
         version=f'%(prog)s {__version__}'
     )
-    
-    parser.add_argument(
+
+    # Options shared by every subcommand live on a parent parser so they are
+    # accepted *after* the subcommand (e.g. `backup --auth-method imap
+    # --backup-dir ...`), which is the form used throughout the docs.
+    common = argparse.ArgumentParser(add_help=False)
+
+    common.add_argument(
         '--backup-dir',
         type=str,
         default='~/gmail-backup',
         help='Directory to store backup files.'
     )
-    
-    parser.add_argument(
+
+    common.add_argument(
         '--log-level',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         default='INFO',
         help='Set the logging level.'
     )
-    
-    # Subcommands
-    subparsers = parser.add_subparsers(
-        dest='command',
-        required=True,
-        help='Command to execute.'
-    )
-    
-    # Backup command
-    backup_parser = subparsers.add_parser(
-        'backup',
-        help='Backup Gmail emails.'
-    )
-    
-    backup_parser.add_argument(
-        '--max-results',
-        type=int,
-        help='Maximum number of emails to process.'
-    )
-    
-    backup_parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=100,
-        help='Number of emails to process in each batch.'
-    )
-    
-    backup_parser.add_argument(
-        '--state-file',
-        type=str,
-        help='Path to the backup state file.'
-    )
-    
-    # Restore command
-    restore_parser = subparsers.add_parser(
-        'restore',
-        help='Restore Gmail emails from backup.'
-    )
-    
-    restore_parser.add_argument(
-        '--max-results',
-        type=int,
-        help='Maximum number of emails to restore.'
-    )
-    
-    restore_parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=10,
-        help='Number of emails to restore in each batch.'
-    )
-    
-    restore_parser.add_argument(
-        '--state-file',
-        type=str,
-        help='Path to the restore state file.'
-    )
-    
+
     # Authentication arguments
-    auth_group = parser.add_argument_group('Authentication')
-    
+    auth_group = common.add_argument_group('Authentication')
+
     auth_group.add_argument(
         '--auth-method',
         choices=['oauth', 'browser', 'imap'],
@@ -129,46 +78,113 @@ For more information, see: https://github.com/junxit/gmail-archiver
         help='Authentication method: oauth (requires client_secrets.json), '
              'browser (opens browser for Google login), or imap (uses app password).'
     )
-    
+
     # OAuth arguments
-    oauth_group = parser.add_argument_group('OAuth Authentication')
-    
+    oauth_group = common.add_argument_group('OAuth Authentication')
+
     oauth_group.add_argument(
         '--client-secrets',
         type=str,
         default='client_secrets.json',
         help='Path to the OAuth client secrets file (for oauth method).'
     )
-    
+
     oauth_group.add_argument(
         '--token',
         type=str,
         default='~/.gmail-archiver/token.json',
         help='Path to the OAuth token file.'
     )
-    
+
     # IMAP arguments
-    imap_group = parser.add_argument_group('IMAP Authentication')
-    
+    imap_group = common.add_argument_group('IMAP Authentication')
+
     imap_group.add_argument(
         '--email',
         type=str,
         help='Email address for IMAP authentication.'
     )
-    
+
     imap_group.add_argument(
         '--app-password',
         type=str,
         help='App password for IMAP authentication.'
     )
-    
+
     imap_group.add_argument(
         '--imap-server',
         type=str,
         default='imap.gmail.com',
         help='IMAP server address.'
     )
-    
+
+    imap_group.add_argument(
+        '--folder',
+        type=str,
+        default='[Gmail]/All Mail',
+        help='IMAP folder to back up (imap method only). Defaults to all '
+             'archived mail; the exact name may vary by account language.'
+    )
+
+    # Subcommands (each inherits the shared options via parents=[common]).
+    subparsers = parser.add_subparsers(
+        dest='command',
+        required=True,
+        help='Command to execute.'
+    )
+
+    # Backup command
+    backup_parser = subparsers.add_parser(
+        'backup',
+        parents=[common],
+        help='Backup Gmail emails.'
+    )
+
+    backup_parser.add_argument(
+        '--max-results',
+        type=int,
+        help='Maximum number of emails to process.'
+    )
+
+    backup_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=100,
+        help='Number of emails to process in each batch.'
+    )
+
+    backup_parser.add_argument(
+        '--state-file',
+        type=str,
+        help='Path to the backup state file.'
+    )
+
+    # Restore command
+    restore_parser = subparsers.add_parser(
+        'restore',
+        parents=[common],
+        help='Restore Gmail emails from backup.'
+    )
+
+    restore_parser.add_argument(
+        '--max-results',
+        type=int,
+        help='Maximum number of emails to restore.'
+    )
+
+    restore_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=10,
+        help='Number of emails to restore in each batch.'
+    )
+
+    restore_parser.add_argument(
+        '--state-file',
+        type=str,
+        help='Path to the restore state file.'
+    )
+
     return parser.parse_args()
 
 
@@ -263,29 +279,44 @@ def main() -> None:
         backup_dir = Path(args.backup_dir).expanduser().resolve()
         
         if args.command == 'backup':
-            # Get credentials (OAuth or browser flow)
-            if args.auth_method == 'imap':
-                logger.error("IMAP authentication is not yet fully supported for backup. Please use oauth or browser.")
-                sys.exit(1)
-            
-            credentials = get_credentials(args)
-            service = get_gmail_service(credentials)
-            
-            # Get state file path
+            # State file path is shared across all auth methods.
             state_file = get_state_file(args, 'backup')
-            
-            # Initialize backup
-            backup = GmailBackup(
-                gmail_service=service,
-                backup_dir=backup_dir,
-                state_file=state_file,
-                batch_size=args.batch_size,
-            )
-            
-            # Run backup
-            logger.info(f"Starting backup to {backup_dir}")
-            result = backup.backup_emails(max_results=args.max_results)
-            
+
+            if args.auth_method == 'imap':
+                # IMAP (app password) backup — no OAuth. Writes the identical
+                # on-disk format as the API path so the existing restore can
+                # read IMAP-made backups.
+                mailbox = get_credentials(args)
+                backup = ImapBackup(
+                    mailbox=mailbox,
+                    backup_dir=backup_dir,
+                    state_file=state_file,
+                    folder=args.folder,
+                    batch_size=args.batch_size,
+                )
+                logger.info(f"Starting IMAP backup to {backup_dir}")
+                try:
+                    result = backup.backup_emails(max_results=args.max_results)
+                finally:
+                    try:
+                        mailbox.logout()
+                    except Exception:
+                        pass
+            else:
+                # OAuth / browser flow (unchanged).
+                credentials = get_credentials(args)
+                service = get_gmail_service(credentials)
+
+                backup = GmailBackup(
+                    gmail_service=service,
+                    backup_dir=backup_dir,
+                    state_file=state_file,
+                    batch_size=args.batch_size,
+                )
+
+                logger.info(f"Starting backup to {backup_dir}")
+                result = backup.backup_emails(max_results=args.max_results)
+
             print("\n" + "="*60)
             print("BACKUP COMPLETE")
             print("="*60)
@@ -297,7 +328,7 @@ def main() -> None:
         elif args.command == 'restore':
             # Get credentials
             if args.auth_method == 'imap':
-                logger.error("IMAP authentication is not supported for restore. Please use oauth or browser.")
+                logger.error("IMAP is supported for backup only. Please use oauth or browser for restore.")
                 sys.exit(1)
             
             credentials = get_credentials(args)

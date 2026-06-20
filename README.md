@@ -212,9 +212,11 @@ For more control or organizational use, set up your own OAuth credentials:
    gmail-archiver backup --auth-method oauth --client-secrets client_secrets.json --backup-dir ~/gmail-backup
    ```
 
-### Option C: IMAP (App Password)
+### Option C: IMAP (App Password) — backup only, no OAuth
 
-Use IMAP authentication with a Google App Password:
+Back up over IMAP using a Google **App Password**. This path never uses OAuth and
+produces the **exact same on-disk format** as the OAuth/browser backups, so the
+restore command can read IMAP-made backups unchanged.
 
 1. **Enable 2-Step Verification**
    - Go to your [Google Account Security](https://myaccount.google.com/security)
@@ -227,10 +229,45 @@ Use IMAP authentication with a Google App Password:
    - Enter "Gmail Archiver" as the name
    - Click "Generate" and copy the 16-character password
 
-3. **Run with IMAP**
+3. **Run the backup**
    ```bash
-   gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" --backup-dir ~/gmail-backup
+   gmail-archiver backup \
+     --auth-method imap \
+     --email your.email@gmail.com \
+     --app-password "xxxx xxxx xxxx xxxx" \
+     --backup-dir ~/gmail-backup
+
+   # Or with uv (no virtual environment activation needed):
+   uv run gmail-archiver backup --auth-method imap \
+     --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" \
+     --backup-dir ~/gmail-backup
    ```
+
+   - **All Mail by default:** the IMAP backup reads Gmail's `[Gmail]/All Mail`
+     folder, so every archived message is captured — not just the inbox. Override
+     with `--folder` (the exact name can vary by account language), for example
+     `--folder "INBOX"`.
+   - **Incremental:** re-running skips messages already backed up (keyed by
+     Gmail's permanent `X-GM-MSGID`), so only new mail is downloaded.
+   - **Never marks mail as read:** the mailbox is opened read-only and messages
+     are fetched with `BODY.PEEK[]`.
+   - **Your app password is never logged** and is never written into the backup.
+
+> **Restore is OAuth/browser-only.** IMAP is for backup only. Restore an
+> IMAP-made backup with OAuth or the browser flow, e.g.
+> `gmail-archiver restore --auth-method browser --backup-dir ~/gmail-backup`.
+
+#### IMAP label preservation caveats
+
+IMAP exposes Gmail labels via the `X-GM-LABELS` extension. The backup normalizes
+them to match the API path's label vocabulary as closely as IMAP allows:
+
+| Aspect | Behavior |
+|---|---|
+| **System labels** | Mapped to the same ids the API uses (`\Inbox`→`INBOX`, `\Sent`→`SENT`, `\Important`→`IMPORTANT`, `\Starred`→`STARRED`, `\Draft`→`DRAFT`, `\Trash`→`TRASH`, `\Junk`/`\Spam`→`SPAM`). |
+| **Read state** | `UNREAD` is synthesized from the IMAP `\Seen` flag (IMAP read state is a flag, not a label). |
+| **User labels** | Stored by **name**, because IMAP exposes label names rather than the API's internal `Label_NNN` ids. On restore these names are not valid Gmail label ids, so re-applying user labels is best-effort — message content and system labels restore normally. |
+| **Categories** | Gmail categories (`CATEGORY_*`) are not exposed via `X-GM-LABELS`, so they are absent from IMAP-made backups. |
 
 ### Environment Variables (Optional)
 
@@ -258,8 +295,11 @@ gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
 # Using OAuth with custom credentials
 gmail-archiver backup --auth-method oauth --client-secrets ~/credentials.json --backup-dir ~/gmail-backup
 
-# Using IMAP
-gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx" --backup-dir ~/gmail-backup
+# Using IMAP (App Password) — backs up [Gmail]/All Mail by default, incremental on re-run
+gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" --backup-dir ~/gmail-backup
+
+# IMAP: back up a specific folder instead of All Mail
+gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" --folder "INBOX" --backup-dir ~/gmail-backup
 
 # With uv (no virtual environment activation needed)
 uv run gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
@@ -334,6 +374,11 @@ Each email's metadata is stored as a JSON file:
   "backup_time": "2024-01-01T12:00:00Z"
 }
 ```
+
+> Both the OAuth/browser and IMAP backends write this **identical** schema and
+> directory layout, so a backup made by either is restorable by the same restore
+> command. IMAP-made backups differ only in label vocabulary (user labels and
+> categories) — see [IMAP label preservation caveats](#imap-label-preservation-caveats).
 
 ## 🐛 Troubleshooting
 

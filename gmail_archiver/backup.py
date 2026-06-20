@@ -102,63 +102,137 @@ class GmailBackup:
             return None
     
     def _save_email(self, email_data: Dict, labels: List[str]) -> Optional[Path]:
-        """Save an email to disk.
-        
+        """Save an email from the Gmail API to disk.
+
+        Decodes the API's base64 ``raw`` payload and delegates the actual write
+        to :meth:`_write_email`, the shared writer used by both the API and IMAP
+        backup paths.
+
         Args:
             email_data: The email data from the Gmail API.
             labels: List of labels for the email.
-            
+
         Returns:
             Path to the saved email file, or None if saving failed.
         """
         try:
             # Decode the raw email data
             msg_str = base64.urlsafe_b64decode(email_data['raw'].encode('ASCII'))
-            
-            # Parse the email to get metadata
-            msg = parse_email_message(msg_str)
-            
+
+            return self._write_email(
+                raw_bytes=msg_str,
+                msg_id=email_data['id'],
+                thread_id=email_data.get('threadId'),
+                internal_date_ms=email_data.get('internalDate'),
+                labels=labels,
+            )
+        except Exception as e:
+            logger.error("Error saving email %s: %s", email_data.get('id', 'unknown'), e)
+            return None
+
+    def _write_email(
+        self,
+        raw_bytes: bytes,
+        msg_id: str,
+        thread_id: Optional[str],
+        internal_date_ms: Optional[str],
+        labels: List[str],
+    ) -> Optional[Path]:
+        """Write raw RFC822 bytes to disk as ``.eml`` plus a metadata sidecar.
+
+        This is the shared, transport-agnostic writer used by both the Gmail API
+        backup path (via :meth:`_save_email`) and the IMAP backup path, so the
+        two backends always produce an identical on-disk format.
+
+        Args:
+            raw_bytes: The raw RFC822 message bytes.
+            msg_id: Stable message identifier used as the on-disk key (the Gmail
+                API message id for the API path; X-GM-MSGID or the RFC822
+                Message-ID for the IMAP path).
+            thread_id: Thread identifier, or None.
+            internal_date_ms: Message internal date as a Unix-millisecond string,
+                used both for the ``YYYY/MM`` directory and the ``internal_date``
+                metadata field.
+            labels: Labels to record in the metadata sidecar.
+
+        Returns:
+            Path to the saved ``.eml`` file, or None if writing failed.
+        """
+        try:
+            # Parse the email to get header metadata
+            msg = parse_email_message(raw_bytes)
+
             # Generate a unique filename
-            msg_id = email_data['id']
-            email_hash = get_email_hash(msg_str)
+            email_hash = get_email_hash(raw_bytes)
             safe_subject = get_safe_filename(msg.get('subject', 'no-subject'))
             filename = f"{msg_id}_{email_hash[:8]}_{safe_subject}.eml"
-            
+
             # Create a directory structure based on the date
-            date = datetime.fromtimestamp(int(email_data['internalDate']) / 1000)
+            date = datetime.fromtimestamp(int(internal_date_ms) / 1000)
             email_dir = self.emails_dir / str(date.year) / f"{date.month:02d}"
             ensure_directory_exists(email_dir)
-            
+
             # Save the email
             email_path = email_dir / filename
             with open(email_path, 'wb') as f:
-                f.write(msg_str)
-            
+                f.write(raw_bytes)
+
             # Save metadata
             metadata = {
                 'message_id': msg_id,
-                'thread_id': email_data.get('threadId'),
+                'thread_id': thread_id,
                 'subject': msg.get('Subject', 'no-subject'),
                 'from': msg.get('From', ''),
                 'to': msg.get('To', ''),
                 'date': msg.get('Date', ''),
                 'labels': labels,
-                'internal_date': email_data.get('internalDate'),
-                'size': len(msg_str),
+                'internal_date': internal_date_ms,
+                'size': len(raw_bytes),
                 'backup_path': str(email_path.relative_to(self.backup_dir)),
                 'backup_time': datetime.now(timezone.utc).isoformat(),
             }
-            
+
             metadata_path = self.metadata_dir / f"{msg_id}.json"
             with open(metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
-            
+
             return email_path
-            
+
         except Exception as e:
-            logger.error("Error saving email %s: %s", email_data.get('id', 'unknown'), e)
+            logger.error("Error saving email %s: %s", msg_id, e)
             return None
-    
+
+    def _record_backup(
+        self,
+        email_path: Path,
+        msg_id: str,
+        thread_id: Optional[str],
+        internal_date_ms: Optional[str],
+        labels: List[str],
+    ) -> None:
+        """Record a freshly written email in the backup state.
+
+        Shared by the API and IMAP backup paths so both update ``BackupState``
+        identically (keyed by ``msg_id``), which is what makes re-runs skip
+        already-backed-up messages.
+
+        Args:
+            email_path: Path to the saved ``.eml`` file.
+            msg_id: Stable message identifier (matches the on-disk key).
+            thread_id: Thread identifier, or None.
+            internal_date_ms: Message internal date as a Unix-millisecond string.
+            labels: Labels for the message.
+        """
+        email_meta = EmailMetadata(
+            message_id=msg_id,
+            thread_id=thread_id,
+            labels=set(labels),
+            internal_date=datetime.fromtimestamp(int(internal_date_ms or '0') / 1000),
+            backup_path=email_path,
+            size=os.path.getsize(email_path),
+        )
+        self.state.add_email(email_meta)
+
     def _process_email_batch(self, message_ids: List[str]) -> Tuple[int, int]:
         """Process a batch of email messages.
         
@@ -193,16 +267,14 @@ class GmailBackup:
                     continue
                 
                 # Update the backup state
-                email_meta = EmailMetadata(
-                    message_id=msg_id,
-                    thread_id=email_data.get('threadId'),
-                    labels=set(labels),
-                    internal_date=datetime.fromtimestamp(int(email_data.get('internalDate', '0')) / 1000),
-                    backup_path=email_path,
-                    size=os.path.getsize(email_path)
+                self._record_backup(
+                    email_path,
+                    msg_id,
+                    email_data.get('threadId'),
+                    email_data.get('internalDate'),
+                    labels,
                 )
-                self.state.add_email(email_meta)
-                
+
                 processed += 1
                 if processed % 10 == 0:
                     logger.info("Processed %d emails...", processed)
