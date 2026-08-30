@@ -4,9 +4,11 @@ Global options (auth, backup dir, log level, IMAP settings) must be accepted
 either *before* or *after* the subcommand, and must fall back to the documented
 defaults when omitted.
 """
+import os
 import unittest
+from unittest.mock import patch
 
-from gmail_archiver.cli import parse_args
+from gmail_archiver.cli import parse_args, resolve_app_password
 
 
 class TestCliArgOrdering(unittest.TestCase):
@@ -80,6 +82,47 @@ class TestCliArgOrdering(unittest.TestCase):
     def test_log_level_before_subcommand(self):
         args = parse_args(['--log-level', 'DEBUG', 'backup'])
         self.assertEqual(args.log_level, 'DEBUG')
+
+
+class TestAppPasswordResolution(unittest.TestCase):
+    """The app password must not be prompted for more than once per run."""
+
+    def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {}, clear=False)
+        self.env_patcher.start()
+        os.environ.pop('GMAIL_ARCHIVER_APP_PASSWORD', None)
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
+    def test_environment_variable_wins(self):
+        os.environ['GMAIL_ARCHIVER_APP_PASSWORD'] = 'from-env'
+        args = parse_args(['backup', '--app-password', 'from-argv'])
+
+        self.assertEqual(resolve_app_password(args), 'from-env')
+
+    def test_falls_back_to_flag(self):
+        args = parse_args(['backup', '--app-password', 'from-argv'])
+
+        self.assertEqual(resolve_app_password(args), 'from-argv')
+
+    def test_prompts_only_once(self):
+        """A second call reuses the answer instead of asking again."""
+        args = parse_args(['backup'])
+
+        with patch('gmail_archiver.cli.sys.stdin.isatty', return_value=True), \
+             patch('gmail_archiver.cli.getpass.getpass', return_value='typed') as prompt:
+            first = resolve_app_password(args)
+            second = resolve_app_password(args)
+
+        self.assertEqual((first, second), ('typed', 'typed'))
+        prompt.assert_called_once()
+
+    def test_returns_none_when_non_interactive(self):
+        args = parse_args(['backup'])
+
+        with patch('gmail_archiver.cli.sys.stdin.isatty', return_value=False):
+            self.assertIsNone(resolve_app_password(args))
 
 
 if __name__ == '__main__':

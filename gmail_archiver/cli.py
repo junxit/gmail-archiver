@@ -298,24 +298,36 @@ def resolve_app_password(args) -> Optional[str]:
     still accepted for compatibility but warns, because an argv value is readable
     by any local user through ``ps`` and is written to shell history.
 
+    The result is cached on ``args`` so that callers which need the password
+    again — the backup path builds a reconnect callable from it — do not prompt
+    the user a second time.
+
     Args:
         args: Parsed command-line arguments.
 
     Returns:
         The password, or None if no value could be obtained.
     """
+    cached = getattr(args, '_resolved_app_password', None)
+    if cached is not None:
+        return cached
+
     env_password = os.environ.get('GMAIL_ARCHIVER_APP_PASSWORD')
     if env_password:
-        return env_password
-    if args.app_password:
+        password = env_password
+    elif args.app_password:
         logger.warning(
             "--app-password is visible to other users via `ps` and is stored in "
             "your shell history. Prefer GMAIL_ARCHIVER_APP_PASSWORD."
         )
-        return args.app_password
-    if sys.stdin.isatty():
-        return getpass.getpass('Gmail app password: ')
-    return None
+        password = args.app_password
+    elif sys.stdin.isatty():
+        password = getpass.getpass('Gmail app password: ')
+    else:
+        return None
+
+    args._resolved_app_password = password
+    return password
 
 
 def get_credentials(args, scopes=None, token_path: Optional[str] = None) -> Union[Credentials, object]:
