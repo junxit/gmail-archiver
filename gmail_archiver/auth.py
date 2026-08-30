@@ -1,22 +1,38 @@
 """Authentication module for Gmail Archiver."""
-import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from imap_tools import MailBox, MailboxLoginError
 
+from .utils import write_atomic
+
 logger = logging.getLogger(__name__)
 
-# If modifying these scopes, delete the token.json file.
-SCOPES = [
+# Backup only ever reads. Keeping write access out of the token the archiver uses
+# day to day means a leaked or misused token cannot delete the mail this tool
+# exists to preserve.
+BACKUP_SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
+]
+
+# Restore writes messages back into the mailbox, so it needs a wider grant. It
+# gets its own consent and its own token file rather than widening the scope of
+# the backup token; see DEFAULT_RESTORE_TOKEN in cli.py.
+RESTORE_SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
 ]
+
+# If modifying these scopes, delete the token file.
+SCOPES = BACKUP_SCOPES
+
+# Owner-only permissions for anything holding a credential.
+_SECRET_FILE_MODE = 0o600
+_SECRET_DIR_MODE = 0o700
 
 # Bundled OAuth client credentials for browser-based authentication
 # Users can use their own credentials by providing a client_secrets.json file
@@ -33,38 +49,66 @@ BUNDLED_CLIENT_CONFIG = {
 }
 
 
-def get_gmail_credentials(token_path: str, credentials_path: str) -> Credentials:
+def save_token(creds: Credentials, token_path: Union[str, Path]) -> None:
+    """Persist OAuth credentials with owner-only permissions.
+
+    The file holds a refresh token granting access to the user's mailbox, so it
+    is created mode 0600 from the outset — the bits are passed to ``open(2)``
+    rather than chmod'd afterwards, so the token never exists world-readable even
+    momentarily. The containing directory is tightened to 0700 as well.
+
+    Args:
+        creds: The credentials to persist.
+        token_path: Destination path.
+    """
+    token_path = Path(token_path).expanduser()
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(token_path.parent, _SECRET_DIR_MODE)
+    except OSError as e:  # pragma: no cover - depends on ownership
+        logger.debug("Could not tighten permissions on %s: %s", token_path.parent, e)
+    write_atomic(token_path, creds.to_json().encode('utf-8'), mode=_SECRET_FILE_MODE)
+    logger.info("Credentials saved to %s", token_path)
+
+
+def get_gmail_credentials(
+    token_path: str,
+    credentials_path: str,
+    scopes: Optional[List[str]] = None,
+) -> Credentials:
     """Get valid user credentials from storage or prompt for login.
-    
+
     Args:
         token_path: Path to the token file.
         credentials_path: Path to the credentials file.
-        
+        scopes: OAuth scopes to request. Defaults to the read-only backup scopes.
+
     Returns:
         Credentials, the obtained credential.
-        
+
     Raises:
         FileNotFoundError: If credentials file doesn't exist.
         ValueError: If credentials file is invalid.
     """
     creds = None
+    scopes = scopes or BACKUP_SCOPES
     token_path = Path(token_path).expanduser().resolve()
     credentials_path = Path(credentials_path).expanduser().resolve()
-    
+
     # Check if credentials file exists
     if not credentials_path.exists():
         raise FileNotFoundError(
             f"Credentials file not found: {credentials_path}\n"
             "Please download OAuth credentials from Google Cloud Console or use --auth-method browser"
         )
-    
+
     if token_path.exists():
         try:
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token_path), scopes)
         except Exception as e:
             logger.warning(f"Failed to load existing token: {e}")
             creds = None
-    
+
     # If there are no (valid) credentials available, let the user log in.
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -73,58 +117,62 @@ def get_gmail_credentials(token_path: str, credentials_path: str) -> Credentials
             except Exception as e:
                 logger.warning(f"Failed to refresh token: {e}. Re-authenticating...")
                 creds = None
-        
+
         if not creds:
             flow = InstalledAppFlow.from_client_secrets_file(
-                str(credentials_path), SCOPES)
+                str(credentials_path), scopes)
             creds = flow.run_local_server(port=0)
-        
-        # Save the credentials for the next run
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(token_path, 'w', encoding='utf-8') as token:
-            token.write(creds.to_json())
-        logger.info(f"Credentials saved to {token_path}")
-    
+
+        save_token(creds, token_path)
+
     return creds
 
 
 def get_gmail_credentials_browser(
     token_path: Optional[str] = None,
-    client_config: Optional[Dict[str, Any]] = None
+    client_config: Optional[Dict[str, Any]] = None,
+    scopes: Optional[List[str]] = None,
 ) -> Credentials:
     """Get Gmail credentials using browser-based OAuth without custom credentials file.
-    
+
     This method allows users to authenticate without creating their own Google Cloud
     project. It uses bundled OAuth credentials or user-provided config.
-    
+
+    Note that ``BUNDLED_CLIENT_CONFIG`` ships as placeholders — publishing a real
+    client secret in an open repository would let anyone impersonate this
+    application — so this path requires the user to supply their own OAuth client
+    and raises a ValueError explaining how if they have not.
+
     Args:
         token_path: Path to store the token file. Defaults to ~/.gmail-archiver/token.json
         client_config: Optional custom OAuth client configuration. If not provided,
                        uses the bundled credentials.
-        
+        scopes: OAuth scopes to request. Defaults to the read-only backup scopes.
+
     Returns:
         Credentials, the obtained credential.
-        
+
     Raises:
         ValueError: If authentication fails.
     """
     # Default token path
+    scopes = scopes or BACKUP_SCOPES
     if token_path is None:
         token_path = Path.home() / '.gmail-archiver' / 'token.json'
     else:
         token_path = Path(token_path).expanduser().resolve()
-    
+
     creds = None
-    
+
     # Try to load existing credentials
     if token_path.exists():
         try:
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token_path), scopes)
             logger.info("Loaded existing credentials from token file")
         except Exception as e:
             logger.warning(f"Failed to load existing token: {e}")
             creds = None
-    
+
     # Refresh or get new credentials
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -134,11 +182,11 @@ def get_gmail_credentials_browser(
             except Exception as e:
                 logger.warning(f"Failed to refresh token: {e}. Re-authenticating...")
                 creds = None
-        
+
         if not creds:
             # Use provided config or bundled credentials
             config = client_config or BUNDLED_CLIENT_CONFIG
-            
+
             # Check if bundled credentials are placeholder values
             if config == BUNDLED_CLIENT_CONFIG and "YOUR_CLIENT_ID" in config["installed"]["client_id"]:
                 raise ValueError(
@@ -149,9 +197,9 @@ def get_gmail_credentials_browser(
                     "3. Set up your own OAuth credentials and provide via --client-secrets\n\n"
                     "See README.md for detailed setup instructions."
                 )
-            
-            flow = InstalledAppFlow.from_client_config(config, SCOPES)
-            
+
+            flow = InstalledAppFlow.from_client_config(config, scopes)
+
             logger.info("Opening browser for authentication...")
             print("\n" + "="*60)
             print("AUTHENTICATION REQUIRED")
@@ -159,20 +207,16 @@ def get_gmail_credentials_browser(
             print("A browser window will open for you to sign in to Google.")
             print("After signing in, you'll be redirected back to this application.")
             print("="*60 + "\n")
-            
+
             creds = flow.run_local_server(
                 port=0,
                 prompt='consent',
                 success_message='Authentication successful! You can close this window.',
                 open_browser=True
             )
-        
-        # Save credentials for future use
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(token_path, 'w', encoding='utf-8') as token:
-            token.write(creds.to_json())
-        logger.info(f"Credentials saved to {token_path}")
-    
+
+        save_token(creds, token_path)
+
     return creds
 
 
@@ -210,41 +254,3 @@ def get_imap_credentials(
         raise
 
 
-def save_auth_state(state: Dict[str, Any], state_file: Union[str, Path]) -> None:
-    """Save authentication state to a file.
-    
-    Args:
-        state: Dictionary containing state information.
-        state_file: Path to the state file.
-        
-    Raises:
-        IOError: If file cannot be written.
-    """
-    state_path = Path(state_file).expanduser().resolve()
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(state_path, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    logger.debug(f"Auth state saved to {state_path}")
-
-
-def load_auth_state(state_file: Union[str, Path]) -> Dict[str, Any]:
-    """Load authentication state from a file.
-    
-    Args:
-        state_file: Path to the state file.
-        
-    Returns:
-        Dictionary containing the saved state, or empty dict if file doesn't exist.
-    """
-    state_path = Path(state_file).expanduser().resolve()
-    
-    if not state_path.exists():
-        return {}
-    
-    try:
-        with open(state_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        logger.warning(f"Failed to load auth state from {state_path}: {e}")
-        return {}

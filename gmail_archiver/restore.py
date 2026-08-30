@@ -10,10 +10,13 @@ from typing import Dict, List, Optional, Tuple
 from googleapiclient.discovery import Resource
 from googleapiclient.errors import HttpError
 
-from .models import BackupState, EmailMetadata
-from .utils import ensure_directory_exists, setup_logging
+from .utils import ensure_within, setup_logging, write_atomic
 
 logger = logging.getLogger(__name__)
+
+# Matches backup.API_NUM_RETRIES; googleapiclient applies exponential backoff
+# with jitter to 429/500/503 responses.
+API_NUM_RETRIES = 5
 
 class GmailRestore:
     """Class to handle Gmail restore operations."""
@@ -50,25 +53,44 @@ class GmailRestore:
             raise ValueError("Invalid backup directory structure. Missing 'emails' or 'metadata' directory.")
     
     def _load_state(self) -> Dict:
-        """Load the restore state from the state file."""
+        """Load the restore state from the state file.
+
+        A corrupt state file is *not* silently treated as a fresh start: losing
+        ``restored_message_ids`` would make the next run re-import every message,
+        duplicating the user's entire mailbox. The caller must decide.
+
+        Raises:
+            ValueError: If the state file exists but cannot be parsed.
+        """
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    state = json.load(f)
             except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Failed to load restore state: %s. Starting fresh.", e)
+                raise ValueError(
+                    f"Restore state at {self.state_file} is unreadable ({e}). "
+                    "Continuing would re-import every message and duplicate your "
+                    "mailbox. Inspect or delete the file, then re-run."
+                ) from e
+            # Membership is checked once per message; a set keeps that O(1).
+            state['restored_message_ids'] = set(state.get('restored_message_ids') or [])
+            return state
         return {
-            'restored_message_ids': [],
+            'restored_message_ids': set(),
             'last_restore_time': None,
             'total_restored': 0,
             'total_errors': 0,
         }
-    
+
     def _save_state(self) -> None:
-        """Save the current restore state to the state file."""
+        """Save the current restore state to the state file, atomically."""
         try:
-            with open(self.state_file, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, indent=2, ensure_ascii=False)
+            serializable = dict(self.state)
+            serializable['restored_message_ids'] = sorted(self.state['restored_message_ids'])
+            write_atomic(
+                self.state_file,
+                json.dumps(serializable, indent=2, ensure_ascii=False).encode('utf-8'),
+            )
         except OSError as e:
             logger.error("Failed to save restore state: %s", e)
             raise
@@ -99,7 +121,7 @@ class GmailRestore:
                 userId='me',
                 body=message,
                 internalDateSource='dateHeader',
-            ).execute()
+            ).execute(num_retries=API_NUM_RETRIES)
             
             logger.debug("Imported message: %s", result['id'])
             return result['id']
@@ -134,22 +156,32 @@ class GmailRestore:
                 # Load the metadata
                 with open(meta_file, 'r', encoding='utf-8') as f:
                     metadata = json.load(f)
-                
-                # Find the email file
-                backup_path = self.backup_dir / metadata['backup_path']
+
+                # Find the email file. The recorded path is data, not code: an
+                # absolute or ..-bearing value would make restore read an
+                # arbitrary local file and upload it into the user's mailbox, so
+                # it is confined to the backup directory before being opened.
+                try:
+                    backup_path = ensure_within(
+                        self.backup_dir / metadata['backup_path'], self.backup_dir
+                    )
+                except (ValueError, KeyError) as e:
+                    logger.error("Refusing to restore %s: %s", meta_file.name, e)
+                    errors += 1
+                    continue
                 if not backup_path.exists():
                     logger.error("Email file not found: %s", backup_path)
                     errors += 1
                     continue
-                
+
                 # Import the email
                 new_msg_id = self._import_email(backup_path, metadata)
                 if not new_msg_id:
                     errors += 1
                     continue
-                
+
                 # Update the state
-                self.state['restored_message_ids'].append(msg_id)
+                self.state['restored_message_ids'].add(msg_id)
                 processed += 1
                 
                 if processed % 5 == 0:

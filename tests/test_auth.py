@@ -7,64 +7,62 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, mock_open
 
 from gmail_archiver.auth import (
+    BACKUP_SCOPES,
+    RESTORE_SCOPES,
     get_gmail_credentials,
     get_gmail_credentials_browser,
     get_imap_credentials,
-    save_auth_state,
-    load_auth_state,
+    save_token,
     SCOPES,
 )
 
 
-class TestSaveLoadAuthState(unittest.TestCase):
-    """Test cases for save_auth_state and load_auth_state functions."""
-    
-    def test_save_and_load_auth_state(self):
-        """Test saving and loading auth state."""
-        test_state = {"test_key": "test_value", "nested": {"key": 123}}
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as temp_file:
-            temp_path = temp_file.name
-        
-        try:
-            # Test saving state
-            save_auth_state(test_state, temp_path)
-            self.assertTrue(os.path.exists(temp_path))
-            
-            # Test loading state
-            loaded_state = load_auth_state(temp_path)
-            self.assertEqual(loaded_state, test_state)
-            
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-    
-    def test_load_nonexistent_file(self):
-        """Test loading from non-existent file returns empty dict."""
-        result = load_auth_state('/nonexistent/path/state.json')
-        self.assertEqual(result, {})
-    
-    def test_load_invalid_json(self):
-        """Test loading invalid JSON returns empty dict."""
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.json', mode='w') as temp_file:
-            temp_file.write("not valid json {{{")
-            temp_path = temp_file.name
-        
-        try:
-            result = load_auth_state(temp_path)
-            self.assertEqual(result, {})
-        finally:
-            os.unlink(temp_path)
-    
-    def test_save_creates_parent_directories(self):
-        """Test save_auth_state creates parent directories."""
+class TestSaveToken(unittest.TestCase):
+    """The token file holds a refresh token, so it must never be world-readable."""
+
+    def _creds(self, payload='{"refresh_token": "secret"}'):
+        creds = MagicMock()
+        creds.to_json.return_value = payload
+        return creds
+
+    def test_token_written_owner_only(self):
+        """The saved token is mode 0600."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            nested_path = os.path.join(temp_dir, 'nested', 'dir', 'state.json')
-            save_auth_state({'key': 'value'}, nested_path)
-            
-            self.assertTrue(os.path.exists(nested_path))
-            loaded = load_auth_state(nested_path)
-            self.assertEqual(loaded, {'key': 'value'})
+            token_path = os.path.join(temp_dir, 'token.json')
+            save_token(self._creds(), token_path)
+
+            mode = os.stat(token_path).st_mode & 0o777
+            self.assertEqual(mode, 0o600, f"expected 0600, got {oct(mode)}")
+
+    def test_token_directory_is_owner_only(self):
+        """The directory holding the token is tightened to 0700."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token_path = os.path.join(temp_dir, 'nested', 'token.json')
+            save_token(self._creds(), token_path)
+
+            mode = os.stat(os.path.dirname(token_path)).st_mode & 0o777
+            self.assertEqual(mode, 0o700, f"expected 0700, got {oct(mode)}")
+
+    def test_creates_parent_directories_and_round_trips(self):
+        """save_token creates missing parents and writes the credential JSON."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token_path = os.path.join(temp_dir, 'a', 'b', 'token.json')
+            save_token(self._creds('{"refresh_token": "abc"}'), token_path)
+
+            self.assertTrue(os.path.exists(token_path))
+            self.assertEqual(json.loads(Path(token_path).read_text()),
+                             {"refresh_token": "abc"})
+
+    def test_overwrites_existing_token_atomically(self):
+        """Re-saving replaces the old token and leaves no temp file behind."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token_path = os.path.join(temp_dir, 'token.json')
+            save_token(self._creds('{"v": 1}'), token_path)
+            save_token(self._creds('{"v": 2}'), token_path)
+
+            self.assertEqual(json.loads(Path(token_path).read_text()), {"v": 2})
+            leftovers = [p for p in os.listdir(temp_dir) if p.endswith('.tmp')]
+            self.assertEqual(leftovers, [])
 
 
 class TestGetGmailCredentials(unittest.TestCase):
@@ -196,15 +194,23 @@ class TestGetImapCredentials(unittest.TestCase):
 
 
 class TestScopes(unittest.TestCase):
-    """Test cases for OAuth scopes."""
-    
-    def test_scopes_include_gmail_readonly(self):
-        """Test that scopes include readonly access."""
-        self.assertIn('https://www.googleapis.com/auth/gmail.readonly', SCOPES)
-    
-    def test_scopes_include_gmail_modify(self):
-        """Test that scopes include modify access."""
-        self.assertIn('https://www.googleapis.com/auth/gmail.modify', SCOPES)
+    """Backup must not hold write access; only restore may."""
+
+    def test_backup_scopes_are_readonly(self):
+        """The default (backup) scopes grant read access only."""
+        self.assertIn('https://www.googleapis.com/auth/gmail.readonly', BACKUP_SCOPES)
+        self.assertEqual(SCOPES, BACKUP_SCOPES)
+
+    def test_backup_scopes_exclude_write_access(self):
+        """A leaked backup token must not be able to modify or delete mail."""
+        for scope in BACKUP_SCOPES:
+            self.assertNotIn('gmail.modify', scope)
+            self.assertNotIn('gmail.insert', scope)
+            self.assertNotIn('mail.google.com', scope)
+
+    def test_restore_scopes_include_modify(self):
+        """Restore needs write access to import messages back."""
+        self.assertIn('https://www.googleapis.com/auth/gmail.modify', RESTORE_SCOPES)
 
 
 if __name__ == "__main__":

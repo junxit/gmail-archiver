@@ -41,7 +41,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from imap_tools import MailboxFolderSelectError
 
@@ -290,13 +290,20 @@ class ImapBackup(GmailBackup):
     inherited Gmail API methods are unused (``self.gmail`` is None).
     """
 
+    # Number of UIDs per cheap X-GM-MSGID fetch. A single un-chunked
+    # ``UID FETCH 1:*`` over a large All Mail folder returns one enormous
+    # response, which balloons memory and can trip imaplib's line-length ceiling.
+    SWEEP_CHUNK = 2000
+
     def __init__(
         self,
         mailbox,
         backup_dir: Union[str, Path],
-        state_file: Union[str, Path],
+        db_path: Optional[Union[str, Path]] = None,
         folder: str = DEFAULT_FOLDER,
         batch_size: int = 100,
+        verify_existing: bool = True,
+        reconnect=None,
     ) -> None:
         """Initialize the IMAP backup.
 
@@ -304,49 +311,125 @@ class ImapBackup(GmailBackup):
             mailbox: An authenticated ``imap_tools.MailBox`` (see
                 :func:`gmail_archiver.auth.get_imap_credentials`).
             backup_dir: Directory to store the backup files.
-            state_file: Path to the backup state file.
+            db_path: Path to the SQLite index. Defaults to ``index.db`` inside
+                ``backup_dir``.
             folder: IMAP folder to back up. Defaults to ``'[Gmail]/All Mail'`` so
                 all archived mail is captured, not just the inbox.
-            batch_size: Save backup state every this many newly saved messages.
+            batch_size: Commit the index every this many newly saved messages.
+            verify_existing: Stat already-indexed messages before skipping them.
+            reconnect: Optional zero-argument callable returning a fresh
+                authenticated mailbox, used to resume after the server drops the
+                connection mid-run. Without it, a dropped connection ends the run
+                with an error rather than silently reporting success.
         """
         super().__init__(
             gmail_service=None,
             backup_dir=backup_dir,
-            state_file=state_file,
+            db_path=db_path,
             batch_size=batch_size,
+            verify_existing=verify_existing,
         )
         self.mailbox = mailbox
         self.folder = folder
+        self._reconnect = reconnect
+
+    def _select_folder(self) -> None:
+        """Select the configured folder read-only so backup never mutates mail."""
+        try:
+            self.mailbox.folder.set(self.folder, readonly=True)
+        except MailboxFolderSelectError as e:
+            logger.error("Could not select IMAP folder %r: %s", self.folder, e)
+            raise
+
+    def _reconnect_mailbox(self) -> bool:
+        """Re-establish a dropped connection and re-select the folder.
+
+        Returns:
+            True if the connection was restored, False if no reconnect callable
+            was supplied or the attempt failed.
+        """
+        if self._reconnect is None:
+            return False
+        try:
+            self.mailbox = self._reconnect()
+            self._select_folder()
+            logger.info("Reconnected to IMAP server; resuming.")
+            return True
+        except Exception as e:
+            logger.error("Reconnect failed: %s", e)
+            return False
+
+    def _record_uidvalidity(self) -> None:
+        """Record the folder's UIDVALIDITY.
+
+        Dedup keys on ``X-GM-MSGID``, not UID, so a change here is harmless — but
+        it invalidates any UID the archive has seen before and is worth noting.
+        """
+        try:
+            raw = self.mailbox.client.untagged_responses.get('UIDVALIDITY')
+            current = raw[0].decode() if raw else None
+        except Exception:  # pragma: no cover - server/library dependent
+            current = None
+        if not current:
+            return
+        previous = self.store.get_meta('uidvalidity')
+        if previous and previous != current:
+            logger.warning(
+                "IMAP UIDVALIDITY changed (%s -> %s); UIDs were reassigned by the "
+                "server. Dedup is unaffected (it keys on X-GM-MSGID).",
+                previous, current,
+            )
+        self.store.set_meta('uidvalidity', current)
 
     def _sweep_message_ids(self) -> List[Tuple[str, Optional[str]]]:
         """Cheaply list ``(uid, X-GM-MSGID)`` for every message in the folder.
 
         Fetching only ``X-GM-MSGID`` (no bodies) lets re-runs skip
-        already-backed-up messages without downloading them.
+        already-backed-up messages without downloading them. The UID list is
+        gathered first with ``UID SEARCH ALL`` and then fetched in chunks of
+        ``SWEEP_CHUNK`` so the response size stays bounded regardless of mailbox
+        size.
 
         Returns:
             A list of ``(uid, gm_msgid)`` tuples; ``gm_msgid`` is None if the
             server did not return one. Empty list for an empty mailbox.
         """
-        typ, data = self.mailbox.client.uid('FETCH', '1:*', '(X-GM-MSGID)')
+        typ, data = self.mailbox.client.uid('SEARCH', None, 'ALL')
         if typ != 'OK' or not data:
             return []
+        uids = (data[0] or b'').split()
+        if not uids:
+            return []
+
         entries: List[Tuple[str, Optional[str]]] = []
-        for item in data:
-            line = item[0] if isinstance(item, tuple) else item
-            if not isinstance(line, (bytes, bytearray)) or not line:
-                continue
-            uid_match = re.search(rb'\bUID\s+(\d+)', line)
-            if not uid_match:
-                continue
-            gm_match = re.search(rb'X-GM-MSGID\s+(\d+)', line)
-            entries.append((
-                uid_match.group(1).decode(),
-                gm_match.group(1).decode() if gm_match else None,
-            ))
+        for start in range(0, len(uids), self.SWEEP_CHUNK):
+            chunk = uids[start:start + self.SWEEP_CHUNK]
+            typ, resp = self.mailbox.client.uid(
+                'FETCH', b','.join(chunk).decode(), '(X-GM-MSGID)'
+            )
+            if typ != 'OK' or not resp:
+                logger.warning(
+                    "Sweep chunk %d-%d failed (%s); those messages are not "
+                    "enumerated this run.", start, start + len(chunk), typ
+                )
+                raise IOError(f"UID FETCH failed during sweep: {typ}")
+            for item in resp:
+                line = item[0] if isinstance(item, tuple) else item
+                if not isinstance(line, (bytes, bytearray)) or not line:
+                    continue
+                uid_match = re.search(rb'\bUID\s+(\d+)', line)
+                if not uid_match:
+                    continue
+                gm_match = re.search(rb'X-GM-MSGID\s+(\d+)', line)
+                entries.append((
+                    uid_match.group(1).decode(),
+                    gm_match.group(1).decode() if gm_match else None,
+                ))
         return entries
 
-    def _download_and_save(self, uid: str, gm_msgid_hint: Optional[str]) -> Optional[bool]:
+    def _download_and_save(
+        self, uid: str, gm_msgid_hint: Optional[str]
+    ) -> Tuple[Optional[bool], Optional[str]]:
         """Download one message by UID and write it in the shared format.
 
         Args:
@@ -354,18 +437,20 @@ class ImapBackup(GmailBackup):
             gm_msgid_hint: X-GM-MSGID from the cheap sweep, if known.
 
         Returns:
-            True if saved, False on error, None if it was already backed up
-            (determined only after resolving the final id).
+            A ``(outcome, msg_id)`` tuple. ``outcome`` is True if saved, False on
+            error, or None if it was already archived (determined only after
+            resolving the final id). ``msg_id`` is the resolved identifier, or
+            None if it could not be determined.
         """
         typ, data = self.mailbox.client.uid('FETCH', uid, _FETCH_PARTS)
         if typ != 'OK' or not data:
             logger.warning("FETCH failed for UID %s: %s", uid, typ)
-            return False
+            return False, None
 
         attrs, raw_bytes = _parse_fetch_response(data)
         if not raw_bytes:
             logger.warning("No message body returned for UID %s", uid)
-            return False
+            return False, None
 
         # Resolve the stable, cross-run id: prefer X-GM-MSGID, else Message-ID.
         gm_msgid = _search_int(attrs, b'X-GM-MSGID')
@@ -374,35 +459,38 @@ class ImapBackup(GmailBackup):
         elif gm_msgid_hint:
             msg_id = gm_msgid_hint
         else:
+            # Sender-controlled; safe_key() sanitizes it before it reaches a path.
             msg_id = _message_id_fallback(raw_bytes)
         if not msg_id:
             logger.warning("UID %s has no X-GM-MSGID and no Message-ID; skipping", uid)
-            return False
+            return False, None
 
-        if self.state.is_email_backed_up(msg_id):
+        if self.store.is_archived(msg_id) and self._is_intact(msg_id):
             logger.debug("Skipping already backed up message: %s", msg_id)
-            return None
+            return None, msg_id
 
         thrid = _search_int(attrs, b'X-GM-THRID')
         thread_id = str(thrid) if thrid is not None else ''
         internal_date_ms = _internal_date_ms(attrs, raw_bytes)
         labels = normalize_labels(_parse_gm_labels(attrs), _is_seen(attrs))
 
-        email_path = self._write_email(
+        if not self._archive(
             raw_bytes=raw_bytes,
             msg_id=msg_id,
             thread_id=thread_id,
             internal_date_ms=internal_date_ms,
             labels=labels,
-        )
-        if not email_path:
-            return False
+        ):
+            return False, msg_id
 
-        self._record_backup(email_path, msg_id, thread_id, internal_date_ms, labels)
-        return True
+        return True, msg_id
 
-    def backup_emails(self, max_results: Optional[int] = None) -> Dict[str, int]:
+    def backup_emails(self, max_results: Optional[int] = None) -> Dict[str, Any]:
         """Back up emails from the configured IMAP folder.
+
+        Sweeps the whole folder every run and skips what the index already has,
+        so an interrupted run costs only the messages it had not reached — there
+        is no watermark that can advance past undownloaded mail.
 
         Args:
             max_results: Maximum number of new emails to save. If None, save all.
@@ -414,74 +502,107 @@ class ImapBackup(GmailBackup):
         logger.info(
             "Starting Gmail IMAP backup to: %s (folder: %r)", self.backup_dir, self.folder
         )
+        sweep_started_at = datetime.now(timezone.utc).isoformat()
 
-        def _result(processed: int, errors: int) -> Dict[str, int]:
+        def _result(processed: int, errors: int, skipped: int,
+                    tombstoned: int = 0) -> Dict[str, Any]:
             return {
                 'total_processed': processed,
                 'total_errors': errors,
+                'total_skipped': skipped,
                 'emails_processed': processed,
-                'last_backup_time': self.state.last_backup_time.isoformat()
-                if self.state.last_backup_time else None,
+                'tombstoned': tombstoned,
+                'archived_total': self.store.stats()['total_emails'],
             }
 
         try:
             # Select the folder read-only so the backup never mutates the mailbox.
-            try:
-                self.mailbox.folder.set(self.folder, readonly=True)
-            except MailboxFolderSelectError as e:
-                logger.error("Could not select IMAP folder %r: %s", self.folder, e)
-                raise
+            self._select_folder()
+            self._record_uidvalidity()
 
             entries = self._sweep_message_ids()
             if not entries:
                 logger.info("No messages found in folder %r.", self.folder)
-                return _result(0, 0)
+                return _result(0, 0, 0)
 
             logger.info("Found %d messages in %r", len(entries), self.folder)
 
             total_processed = 0
             total_errors = 0
+            total_skipped = 0
+            completed = True
+            seen_batch: List[str] = []
 
             for uid, gm_msgid in entries:
-                # Cheap skip: already backed up, no body download needed.
-                if gm_msgid and self.state.is_email_backed_up(gm_msgid):
+                # Cheap skip: already archived and intact, no body download needed.
+                if gm_msgid and self.store.is_archived(gm_msgid) and self._is_intact(gm_msgid):
                     logger.debug("Skipping already backed up message (X-GM-MSGID %s)", gm_msgid)
-                    continue
+                    total_skipped += 1
+                    seen_batch.append(gm_msgid)
+                else:
+                    try:
+                        outcome, msg_id = self._download_and_save(uid, gm_msgid)
+                    except (imaplib.IMAP4.abort, OSError) as e:
+                        # The connection dropped. Without a reconnect every
+                        # remaining message would "fail" and the run would still
+                        # report success, so recover or stop.
+                        logger.warning("IMAP connection lost on UID %s: %s", uid, e)
+                        if not self._reconnect_mailbox():
+                            self.store.commit()
+                            raise
+                        try:
+                            outcome, msg_id = self._download_and_save(uid, gm_msgid)
+                        except Exception as retry_error:
+                            logger.error(
+                                "Error processing IMAP message UID %s after reconnect: %s",
+                                uid, retry_error,
+                            )
+                            outcome, msg_id = False, gm_msgid
+                    except Exception as e:
+                        logger.error("Error processing IMAP message UID %s: %s", uid, e)
+                        outcome, msg_id = False, gm_msgid
 
-                try:
-                    outcome = self._download_and_save(uid, gm_msgid)
-                except Exception as e:
-                    logger.error("Error processing IMAP message UID %s: %s", uid, e)
-                    outcome = False
+                    if msg_id:
+                        seen_batch.append(msg_id)
 
-                if outcome is True:
-                    total_processed += 1
-                    if total_processed % 10 == 0:
-                        logger.info("Processed %d emails...", total_processed)
-                    if total_processed % self.batch_size == 0:
-                        self.state.last_backup_time = datetime.now(timezone.utc)
-                        self.state.last_backup_count = total_processed
-                        self._save_state()
-                elif outcome is False:
-                    total_errors += 1
-                # outcome is None -> already backed up; not counted.
+                    if outcome is True:
+                        total_processed += 1
+                        if total_processed % 10 == 0:
+                            logger.info("Processed %d emails...", total_processed)
+                    elif outcome is False:
+                        total_errors += 1
+                        if msg_id:
+                            self.store.record_failure(msg_id, f"IMAP fetch/write failed (UID {uid})")
+                    else:
+                        total_skipped += 1
+
+                if len(seen_batch) >= self.batch_size:
+                    self.store.mark_seen(seen_batch)
+                    self.store.commit()
+                    seen_batch.clear()
 
                 if max_results and total_processed >= max_results:
                     logger.info(
                         "Reached maximum number of emails to process (%d)", max_results
                     )
+                    completed = False
                     break
 
-            # Final state flush.
-            self.state.last_backup_time = datetime.now(timezone.utc)
-            self.state.last_backup_count = total_processed
-            self._save_state()
+            if seen_batch:
+                self.store.mark_seen(seen_batch)
+            self.store.commit()
+
+            tombstoned = self._finish_sweep(sweep_started_at, completed, total_errors)
+            stats = self.store.stats()
+            self.store.commit()
 
             logger.info(
-                "IMAP backup completed. Total processed: %d, errors: %d, total size: %s",
-                total_processed, total_errors, format_size(self.state.total_backup_size),
+                "IMAP backup completed. New: %d, skipped: %d, errors: %d, vanished: %d, "
+                "archive size: %s",
+                total_processed, total_skipped, total_errors, tombstoned,
+                format_size(stats['total_size']),
             )
-            return _result(total_processed, total_errors)
+            return _result(total_processed, total_errors, total_skipped, tombstoned)
 
         except Exception as e:
             logger.error("Error during IMAP backup: %s", e, exc_info=True)

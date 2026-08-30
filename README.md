@@ -1,453 +1,398 @@
-<div align="center">
-  <h1>📧 Gmail Archiver</h1>
-  <p>
-    <strong>A robust command-line tool to backup and restore Gmail emails with full metadata preservation</strong>
-  </p>
-  <p>
-    <a href="#features">Features</a> •
-    <a href="#prerequisites">Prerequisites</a> •
-    <a href="#installation">Installation</a> •
-    <a href="#authentication">Authentication</a> •
-    <a href="#usage">Usage</a> •
-    <a href="#backup-format">Backup Format</a> •
-    <a href="#troubleshooting">Troubleshooting</a> •
-    <a href="#contributing">Contributing</a>
-  </p>
-  <p>
-    <a href="https://pypi.org/project/gmail-archiver/">
-      <img alt="PyPI" src="https://img.shields.io/pypi/v/gmail-archiver">
-    </a>
-    <a href="https://github.com/junxit/gmail-archiver/actions/workflows/tests.yml">
-      <img alt="Tests" src="https://github.com/junxit/gmail-archiver/actions/workflows/tests.yml/badge.svg">
-    </a>
-    <a href="https://codecov.io/gh/junxit/gmail-archiver">
-      <img alt="Codecov" src="https://codecov.io/gh/junxit/gmail-archiver/branch/main/graph/badge.svg">
-    </a>
-    <a href="https://github.com/psf/black">
-      <img alt="Code style: black" src="https://img.shields.io/badge/code%20style-black-000000.svg">
-    </a>
-  </p>
-</div>
+# Gmail Archiver
 
-Gmail Archiver is a powerful command-line tool that allows you to:
+Archive every message in a Gmail account to local `.eml` files, on demand.
 
-- **Backup** your Gmail emails with all metadata (labels, timestamps, etc.)
-- **Restore** emails back to Gmail with their original structure
-- **Migrate** emails between accounts
-- **Archive** important communications for compliance or record-keeping
+Built around one guarantee: **once a message is archived, it stays archived** —
+including after it is deleted from Gmail. Re-runs never re-download what they
+already have, and mail that disappears upstream is flagged, never removed.
 
-The tool supports multiple authentication methods including browser-based OAuth, traditional OAuth 2.0, and IMAP with app passwords.
+> **Proprietary.** All rights reserved. See [LICENSE](LICENSE).
 
-## ✨ Features
+---
 
-- **Complete Email Backup**
-  - Download emails as standard `.eml` files
-  - Preserve all metadata (labels, timestamps, message structure)
-  - Handle large attachments efficiently
+## Contents
 
-- **Smart Restoration**
-  - Restore emails with original metadata
-  - Preserve folder/label structure
-  - Handle duplicate detection
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Authentication](#authentication)
+- [How to Run](#how-to-run)
+- [On-disk format](#on-disk-format)
+- [Deleted mail and tombstones](#deleted-mail-and-tombstones)
+- [Recovering from a lost index](#recovering-from-a-lost-index)
+- [How to Test](#how-to-test)
+- [How to Delete / Uninstall](#how-to-delete--uninstall)
+- [Assumptions](#assumptions)
 
-- **Reliable & Efficient**
-  - **Incremental Backups** - Only download new or modified emails
-  - **Resumable Operations** - Continue interrupted transfers
-  - **Batch Processing** - Process emails in configurable batches
+---
 
-- **Flexible Authentication**
-  - Browser-based OAuth (easiest - no setup required)
-  - OAuth 2.0 with custom credentials
-  - IMAP with App Password
+## What it does
 
-- **Advanced Features**
-  - Filter emails by date range, labels, or search queries
-  - Detailed logging and progress tracking
-  - Configurable backup directory structure
-  - State management for reliable operation
+| Capability | Behavior |
+|---|---|
+| **Full download** | Every message is written as a byte-for-byte `.eml` plus a JSON metadata sidecar. |
+| **Deduplication** | A SQLite index keyed by the Gmail permanent message id. A re-run downloads nothing it already holds. |
+| **New-mail detection** | Every run sweeps the whole mailbox and skips what is indexed. There is no timestamp watermark that can advance past mail you never downloaded. |
+| **Self-healing** | Before skipping an indexed message, its file is checked on disk. A missing or truncated `.eml` is re-downloaded. |
+| **Preserves deleted mail** | Archived messages are never removed. When one disappears from Gmail it is flagged with a `vanished_at` timestamp. |
+| **Crash safety** | Every write is atomic (temp file → `fsync` → rename). An interrupted run costs only the messages it had not reached. |
+| **Read-only by default** | Backup requests `gmail.readonly` and selects IMAP folders read-only. It cannot alter or delete your mail. |
+| **Restore** | Optional, and authenticates separately with its own write-scoped token. |
 
-## 🛠 Prerequisites
+---
 
-- **Python 3.8 or higher**
-  - Check your Python version: `python --version`
-  - [Download Python](https://www.python.org/downloads/) if needed
+## How it works
 
-- **Google Account**
-  - A Gmail account with sufficient storage
-  - For OAuth: Access to Google Cloud Console (optional)
-  - For IMAP: 2-Step Verification enabled
-
-## 🚀 Installation
-
-### Using uv (Recommended)
-
-[uv](https://github.com/astral-sh/uv) is a fast Python package manager. If you don't have it installed:
-
-```bash
-# Install uv (macOS/Linux)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Or with Homebrew
-brew install uv
+```mermaid
+flowchart TD
+    A[Start run] --> B{Auth method}
+    B -->|imap| C["UID SEARCH ALL<br/>over [Gmail]/All Mail"]
+    B -->|oauth / browser| D["messages.list<br/>full enumeration"]
+    C --> E["Cheap sweep:<br/>fetch X-GM-MSGID only"]
+    D --> F[Message ids]
+    E --> F
+    F --> G{In index?}
+    G -->|No| H[Download body]
+    G -->|Yes| I{File intact<br/>on disk?}
+    I -->|Yes| J[Skip, mark seen]
+    I -->|No| H
+    H --> K["Write .eml + metadata<br/>atomically"]
+    K --> L[Record in SQLite index]
+    L --> M[Commit batch]
+    J --> M
+    M --> N{Sweep complete<br/>and error-free?}
+    N -->|Yes| O["Tombstone pass:<br/>flag messages not seen"]
+    N -->|No| P[Skip tombstone pass]
+    O --> Q[Done]
+    P --> Q
 ```
 
-Then install Gmail Archiver:
+The tombstone pass is deliberately skipped after a partial or error-bearing
+sweep. A run that was cut short has not *seen* the messages it never reached,
+and flagging on that basis would mark the whole archive as vanished.
+
+---
+
+## Prerequisites
+
+| Requirement | Version |
+|---|---|
+| Operating system | macOS, Linux, or Windows |
+| Python | **3.10+** (developed and tested on 3.14) |
+| [`uv`](https://docs.astral.sh/uv/) | 0.5+ |
+| Gmail account | With either an app password (IMAP) or a Google Cloud OAuth client |
+
+External services: the Gmail IMAP endpoint (`imap.gmail.com:993`) or the Gmail
+API. No database server is required — the index is a local SQLite file.
+
+Disk: budget slightly more than your Gmail storage usage. `.eml` files are
+stored uncompressed.
+
+---
+
+## Installation
 
 ```bash
-# Create a virtual environment and install
-uv venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-uv pip install -e .
+git clone git@github.com:junxit/gmail-archiver.git
+cd gmail-archiver
 
-# Or install dependencies only
-uv pip install -r requirements.txt
+# Create the virtualenv and install from the lockfile
+uv sync
+
+# Include the test dependencies
+uv sync --extra dev
 ```
 
-### Using pip
+Verify:
 
 ```bash
-# Create a virtual environment (recommended)
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install the package in development mode
-pip install -e .
-
-# Or install directly with all dependencies
-pip install -r requirements.txt
-```
-
-### From PyPI
-
-```bash
-# Using uv
-uv pip install gmail-archiver
-
-# Using pip
-pip install gmail-archiver
-```
-
-### From Source
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/junxit/gmail-archiver.git
-   cd gmail-archiver
-   ```
-
-2. **Set up virtual environment and install**
-   
-   Using uv:
-   ```bash
-   uv venv .venv
-   source .venv/bin/activate
-   uv pip install -e .
-   ```
-   
-   Using pip:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   pip install -e .
-   ```
-
-### Verify Installation
-
-```bash
-# Using the installed command
-gmail-archiver --version
-
-# Or run directly with Python
-python -m gmail_archiver.cli --version
-
-# Or with uv (no activation needed)
 uv run gmail-archiver --version
 ```
 
-## 🔐 Authentication
+---
 
-Gmail Archiver supports three authentication methods:
+## Authentication
 
-### Option A: Browser-Based OAuth (Easiest)
+Three methods. **IMAP with an app password is the recommended path** — it needs
+no Google Cloud project.
 
-This is the simplest option - just run the command and a browser window will open for you to sign in:
+### IMAP (app password)
+
+1. Enable 2-Step Verification on the Google account.
+2. Create an app password at <https://myaccount.google.com/apppasswords>.
+3. Enable IMAP in Gmail: Settings → Forwarding and POP/IMAP → Enable IMAP.
+
+Supply the password through the environment, never on the command line:
 
 ```bash
-gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
+export GMAIL_ARCHIVER_EMAIL='you@gmail.com'
+export GMAIL_ARCHIVER_APP_PASSWORD='xxxx xxxx xxxx xxxx'
 ```
 
-- ✅ No Google Cloud Console setup required
-- ✅ Opens browser for secure Google login
-- ✅ Tokens are saved for future use
+If neither the environment variable nor `--app-password` is set, the tool
+prompts interactively.
 
-> **Note:** If you have a `client_secrets.json` file in your directory, it will be used automatically. Otherwise, you'll need to set up your own OAuth credentials (see Option B).
+> `--app-password` still works but is deprecated: an argv value is readable by
+> any other user on the machine via `ps` and is written to your shell history.
 
-### Option B: OAuth 2.0 with Custom Credentials
+### OAuth (`--auth-method oauth`)
 
-For more control or organizational use, set up your own OAuth credentials:
+Requires your own OAuth client from the Google Cloud Console (Desktop app type),
+downloaded as `client_secrets.json`. Backup requests only
+`https://www.googleapis.com/auth/gmail.readonly`.
 
-1. **Create a Google Cloud Project**
-   - Go to [Google Cloud Console](https://console.cloud.google.com/)
-   - Click "Create Project" and follow the prompts
+### Browser (`--auth-method browser`)
 
-2. **Enable Gmail API**
-   - Navigate to "APIs & Services" > "Library"
-   - Search for "Gmail API" and click "Enable"
+The default, but it needs a `client_secrets.json` to be present. No OAuth client
+is bundled — publishing a real client secret in a repository would let anyone
+impersonate this application — so without one this method exits with
+instructions pointing at the other two.
 
-3. **Configure OAuth Consent Screen**
-   - Go to "APIs & Services" > "OAuth consent screen"
-   - Select "External" and click "Create"
-   - Fill in the required app information
-   - Add `https://mail.google.com/` to the authorized domains
-   - Add your email as a test user
+### Where credentials are stored
 
-4. **Create OAuth Credentials**
-   - Go to "APIs & Services" > "Credentials"
-   - Click "Create Credentials" > "OAuth client ID"
-   - Select "Desktop app" as the application type
-   - Download the JSON file and save it as `client_secrets.json`
+| File | Purpose | Permissions |
+|---|---|---|
+| `~/.gmail-archiver/token.json` | Read-only backup token | `0600` in a `0700` directory |
+| `~/.gmail-archiver/token-restore.json` | Write-scoped restore token | `0600` in a `0700` directory |
 
-5. **Run with OAuth**
-   ```bash
-   gmail-archiver backup --auth-method oauth --client-secrets client_secrets.json --backup-dir ~/gmail-backup
-   ```
+The app password is never written to disk.
 
-### Option C: IMAP (App Password) — backup only, no OAuth
+---
 
-Back up over IMAP using a Google **App Password**. This path never uses OAuth and
-produces the **exact same on-disk format** as the OAuth/browser backups, so the
-restore command can read IMAP-made backups unchanged.
+## How to Run
 
-1. **Enable 2-Step Verification**
-   - Go to your [Google Account Security](https://myaccount.google.com/security)
-   - Under "Signing in to Google," select "2-Step Verification"
-   - Follow the prompts to enable it
+```bash
+# Back up over IMAP (recommended)
+uv run gmail-archiver backup --auth-method imap
 
-2. **Generate an App Password**
-   - Go to [App Passwords](https://myaccount.google.com/apppasswords)
-   - Select "Mail" and "Other (Custom name)"
-   - Enter "Gmail Archiver" as the name
-   - Click "Generate" and copy the 16-character password
+# Back up via the Gmail API
+uv run gmail-archiver backup --auth-method oauth --client-secrets ~/client_secrets.json
 
-3. **Run the backup**
-   ```bash
-   gmail-archiver backup \
-     --auth-method imap \
-     --email your.email@gmail.com \
-     --app-password "xxxx xxxx xxxx xxxx" \
-     --backup-dir ~/gmail-backup
+# Try it on a small slice first
+uv run gmail-archiver backup --auth-method imap --backup-dir /tmp/ga-test --max-results 50
 
-   # Or with uv (no virtual environment activation needed):
-   uv run gmail-archiver backup --auth-method imap \
-     --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" \
-     --backup-dir ~/gmail-backup
-   ```
+# See what the archive holds
+uv run gmail-archiver status
+uv run gmail-archiver status --list-vanished --list-failures
 
-   - **All Mail by default:** the IMAP backup reads Gmail's `[Gmail]/All Mail`
-     folder, so every archived message is captured — not just the inbox. Override
-     with `--folder` (the exact name can vary by account language), for example
-     `--folder "INBOX"`.
-   - **Incremental:** re-running skips messages already backed up (keyed by
-     Gmail's permanent `X-GM-MSGID`), so only new mail is downloaded.
-   - **Never marks mail as read:** the mailbox is opened read-only and messages
-     are fetched with `BODY.PEEK[]`.
-   - **Your app password is never logged** and is never written into the backup.
+# Rebuild the index from the archive itself
+uv run gmail-archiver rebuild-index
 
-> **Restore is OAuth/browser-only.** IMAP is for backup only. Restore an
-> IMAP-made backup with OAuth or the browser flow, e.g.
-> `gmail-archiver restore --auth-method browser --backup-dir ~/gmail-backup`.
+# Restore into Gmail (authenticates separately; needs write access)
+uv run gmail-archiver restore
+```
 
-#### IMAP label preservation caveats
+Global options work either before or after the subcommand.
 
-IMAP exposes Gmail labels via the `X-GM-LABELS` extension. The backup normalizes
-them to match the API path's label vocabulary as closely as IMAP allows:
+### Commands
 
-| Aspect | Behavior |
+| Command | Purpose |
 |---|---|
-| **System labels** | Mapped to the same ids the API uses (`\Inbox`→`INBOX`, `\Sent`→`SENT`, `\Important`→`IMPORTANT`, `\Starred`→`STARRED`, `\Draft`→`DRAFT`, `\Trash`→`TRASH`, `\Junk`/`\Spam`→`SPAM`). |
-| **Read state** | `UNREAD` is synthesized from the IMAP `\Seen` flag (IMAP read state is a flag, not a label). |
-| **User labels** | Stored by **name**, because IMAP exposes label names rather than the API's internal `Label_NNN` ids. On restore these names are not valid Gmail label ids, so re-applying user labels is best-effort — message content and system labels restore normally. |
-| **Categories** | Gmail categories (`CATEGORY_*`) are not exposed via `X-GM-LABELS`, so they are absent from IMAP-made backups. |
+| `backup` | Download new mail and refresh the index. |
+| `status` | Print counts, total size, vanished messages, pending retries. |
+| `rebuild-index` | Reconstruct the SQLite index by walking `metadata/` and re-hashing the `.eml` files. |
+| `restore` | Import archived messages back into Gmail. |
 
-### Environment Variables (Optional)
+### Key options
 
-You can set the following environment variables for easier authentication:
+| Option | Default | Notes |
+|---|---|---|
+| `--backup-dir` | `~/gmail-backup` | Where the archive lives. |
+| `--auth-method` | `browser` | `oauth`, `browser`, or `imap`. |
+| `--folder` | `[Gmail]/All Mail` | IMAP only. The name varies by account language. |
+| `--index-db` | `<backup-dir>/index.db` | SQLite index location. |
+| `--batch-size` | `100` | Messages between index commits. |
+| `--max-results` | all | Cap on *new* downloads this run. |
+| `--no-verify-existing` | off | Skip the on-disk size check. Faster, but damage goes unnoticed. |
+| `--log-level` | `INFO` | `DEBUG` also prints tracebacks. |
 
-```bash
-# For OAuth
-export GMAIL_ARCHIVER_CLIENT_SECRETS=path/to/client_secrets.json
+### Exit codes
 
-# For IMAP
-export GMAIL_ARCHIVER_EMAIL=your.email@example.com
-export GMAIL_ARCHIVER_APP_PASSWORD=your_app_password
-```
+| Code | Meaning |
+|---|---|
+| `0` | Completed with no errors. |
+| `1` | Fatal error (auth failure, unreadable index, connection lost with no recovery). |
+| `2` | Completed, but some messages failed. They are queued for retry — see `status --list-failures`. |
+| `130` | Interrupted. Progress is saved; re-run to continue. |
 
-## 💻 Usage
+A scheduled run should treat anything other than `0` as needing attention.
 
-> **Flexible argument order:** global options (`--auth-method`, `--backup-dir`,
-> `--email`, `--app-password`, `--folder`, `--log-level`, …) may be given either
-> before or after the `backup`/`restore` subcommand — e.g.
-> `gmail-archiver backup --auth-method imap …` and
-> `gmail-archiver --auth-method imap … backup` are equivalent. The examples below
-> place them after the subcommand.
+---
 
-### Basic Commands
-
-#### Backup Emails
-
-```bash
-# Browser-based authentication (easiest)
-gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
-
-# Using OAuth with custom credentials
-gmail-archiver backup --auth-method oauth --client-secrets ~/credentials.json --backup-dir ~/gmail-backup
-
-# Using IMAP (App Password) — backs up [Gmail]/All Mail by default, incremental on re-run
-gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" --backup-dir ~/gmail-backup
-
-# IMAP: back up a specific folder instead of All Mail
-gmail-archiver backup --auth-method imap --email your.email@gmail.com --app-password "xxxx xxxx xxxx xxxx" --folder "INBOX" --backup-dir ~/gmail-backup
-
-# With uv (no virtual environment activation needed)
-uv run gmail-archiver backup --auth-method browser --backup-dir ~/gmail-backup
-```
-
-#### Restore Emails
-
-```bash
-# Restore from backup
-gmail-archiver restore --backup-dir ~/gmail-backup
-
-# With uv
-uv run gmail-archiver restore --backup-dir ~/gmail-backup
-```
-
-### Advanced Usage
-
-#### Backup Options
-
-```bash
-# Limit number of emails to backup
-gmail-archiver backup --backup-dir ~/gmail-backup --max-results 100
-
-# Custom batch size for large mailboxes
-gmail-archiver backup --backup-dir ~/gmail-backup --batch-size 50
-
-# Enable debug logging
-gmail-archiver --log-level DEBUG backup --backup-dir ~/gmail-backup
-```
-
-#### Restore Options
-
-```bash
-# Limit number of emails to restore
-gmail-archiver restore --backup-dir ~/gmail-backup --max-results 50
-
-# Custom batch size
-gmail-archiver restore --backup-dir ~/gmail-backup --batch-size 5
-```
-
-## � Backup Format
-
-The backup directory structure is organized as follows:
+## On-disk format
 
 ```
-backup-dir/
-├── emails/                 # Raw .eml files organized by date
-│   └── YYYY/
-│       └── MM/
-│           └── MESSAGE_ID_HASH_SUBJECT.eml
-├── metadata/               # JSON metadata files
-│   └── MESSAGE_ID.json
-├── backup_state.json       # Backup progress and state
-└── restore_state.json      # Restore progress (if restored)
+~/gmail-backup/
+├── emails/
+│   └── 2024/                  # year (UTC)
+│       └── 01/                # month (UTC)
+│           └── <id>_<hash8>_<subject>.eml
+├── metadata/
+│   └── <id>.json
+└── index.db                   # SQLite dedup index (+ -wal, -shm)
 ```
 
-### Metadata Format
-
-Each email's metadata is stored as a JSON file:
+Metadata sidecar:
 
 ```json
 {
-  "message_id": "<message_id>",
-  "thread_id": "<thread_id>",
-  "subject": "Email Subject",
+  "message_id": "1234567890123456789",
+  "thread_id": "1234567890123456789",
+  "subject": "Example",
   "from": "sender@example.com",
-  "to": "recipient@example.com",
+  "to": "you@gmail.com",
   "date": "Mon, 1 Jan 2024 12:00:00 +0000",
   "labels": ["INBOX", "IMPORTANT"],
-  "size": 1024,
-  "backup_path": "emails/2024/01/abc123.eml",
-  "backup_time": "2024-01-01T12:00:00Z"
+  "internal_date": "1704110400000",
+  "size": 4096,
+  "sha256": "…",
+  "backup_path": "emails/2024/01/…eml",
+  "backup_time": "2024-01-02T09:15:00+00:00"
 }
 ```
 
-> Both the OAuth/browser and IMAP backends write this **identical** schema and
-> directory layout, so a backup made by either is restorable by the same restore
-> command. IMAP-made backups differ only in label vocabulary (user labels and
-> categories) — see [IMAP label preservation caveats](#imap-label-preservation-caveats).
+Both backends write the identical format, so an IMAP-made archive is restorable
+by the API-based restore.
 
-## 🐛 Troubleshooting
+### IMAP label caveats
 
-### Common Issues
+IMAP exposes less than the API does. Unavoidable differences:
 
-1. **Authentication Errors**
-   - For browser auth: Ensure you complete the Google sign-in in the browser
-   - For OAuth: Ensure `client_secrets.json` is in the correct location
-   - For IMAP: Verify 2-Step Verification is enabled and app password is correct
-   - Check that the Gmail API is enabled in Google Cloud Console
+| Aspect | Behavior |
+|---|---|
+| System labels | Mapped to the API's ids (`\Inbox`→`INBOX`, `\Sent`→`SENT`, `\Important`→`IMPORTANT`, `\Starred`→`STARRED`, `\Draft`→`DRAFT`, `\Trash`→`TRASH`, `\Junk`/`\Spam`→`SPAM`). |
+| `UNREAD` | Synthesized from the IMAP `\Seen` flag, mirroring the API. |
+| User labels | Stored by display name, since IMAP exposes names rather than `Label_NNN` ids. Restoring them is therefore best-effort. |
+| Categories | `CATEGORY_*` is not exposed over IMAP and is absent. |
+| Read state | Never modified — folders are selected read-only and bodies fetched with `BODY.PEEK[]`. |
 
-2. **Rate Limiting**
-   - Google has rate limits for API and IMAP access
-   - Use `--batch-size` to reduce the number of requests
-   - Add delays between batches if needed
+---
 
-3. **Large Attachments**
-   - For large mailboxes, use `--batch-size` to process in smaller chunks
-   - Consider using `--max-results` to limit the scope
+## Deleted mail and tombstones
 
-### Viewing Logs
-
-Enable verbose logging for debugging:
+Archived `.eml` files are **never deleted by this tool**. When a message the
+archive holds stops appearing in Gmail, its index row gets a `vanished_at`
+timestamp:
 
 ```bash
-gmail-archiver --log-level DEBUG backup --backup-dir ~/gmail-backup
+uv run gmail-archiver status --list-vanished
 ```
 
-## � Testing
+If the message reappears, the flag clears automatically.
 
-Run the test suite:
+### The limitation you should know about
+
+`[Gmail]/All Mail` **excludes Trash and Spam**. So the guarantee is:
+
+> Any message archived at least once is kept forever, and you get a record of
+> when Gmail stopped showing it.
+
+A message deleted in the window *between two runs*, before it was ever archived,
+is not captured. Running frequently keeps that window small. To close it, add
+the Trash and Spam folders as additional runs:
 
 ```bash
-# Using uv
-uv run pytest --cov=gmail_archiver tests/
-
-# Using pip
-pip install pytest pytest-cov
-pytest --cov=gmail_archiver tests/
-
-# Run specific test files
-pytest tests/test_backup.py -v
-pytest tests/test_restore.py -v
+uv run gmail-archiver backup --auth-method imap --folder '[Gmail]/Trash'
+uv run gmail-archiver backup --auth-method imap --folder '[Gmail]/Spam'
 ```
 
-## 🤝 Contributing
+Both write into the same archive and index, so deduplication still holds.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+---
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+## Recovering from a lost index
 
-## 📄 License
+The index is a cache, not the archive. Every column is re-derivable from the
+`metadata/` sidecars and the `.eml` bytes:
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+```bash
+uv run gmail-archiver rebuild-index --backup-dir ~/gmail-backup
+```
 
-## 🙏 Acknowledgments
+An archive made by an older version with a `backup_state.json` is migrated
+automatically on first run; the old file is renamed to
+`backup_state.json.migrated`.
 
-- [Google Gmail API](https://developers.google.com/gmail/api)
-- [python-imap-tools](https://github.com/ikvk/imap_tools)
-- [Google API Python Client](https://github.com/googleapis/google-api-python-client)
-- [uv](https://github.com/astral-sh/uv) - Fast Python package manager
+---
+
+## How to Test
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
+With coverage:
+
+```bash
+uv run pytest --cov=gmail_archiver --cov-report=term-missing
+```
+
+The suite is fully offline — the Gmail API and the IMAP server are mocked, and
+no real credentials are used.
+
+Audit dependencies for published advisories:
+
+```bash
+uvx pip-audit
+```
+
+---
+
+## How to Delete / Uninstall
+
+```bash
+# Remove Python cache files
+find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+find . -type f -name "*.pyc" -delete
+find . -type f -name "*.pyo" -delete
+
+# Remove virtual environments
+rm -rf .venv venv ENV .uv
+
+# Remove build artifacts
+rm -rf build dist *.egg-info .eggs
+
+# Remove test/coverage artifacts
+rm -rf .pytest_cache .coverage htmlcov .tox
+```
+
+Remove stored credentials (revoke the app password at
+<https://myaccount.google.com/apppasswords> as well):
+
+```bash
+rm -rf ~/.gmail-archiver
+```
+
+**Delete the archive itself.** This is irreversible and destroys your only copy
+of any mail already removed from Gmail — check `status --list-vanished` first:
+
+```bash
+rm -rf ~/gmail-backup
+```
+
+---
+
+## Assumptions
+
+- **The archive lives outside the repository.** `~/gmail-backup` by default.
+  `.gitignore` also covers `*.eml`, `emails/`, `metadata/`, `*.db` and the
+  credential filenames, so pointing `--backup-dir` at a working copy still
+  cannot commit mail.
+- **Message identity** is the Gmail permanent id (`X-GM-MSGID` over IMAP, the
+  message id over the API). If neither is available, the RFC822 `Message-ID`
+  header is the fallback — it is sender-controlled, so it is sanitized before
+  it is used as a path component.
+- **Directory bucketing is UTC**, so the layout does not shift with the
+  machine's timezone. Messages archived by versions before 0.2.0 keep their
+  original path; they are not re-filed.
+- **Single run at a time** per backup directory. There is no inter-process lock;
+  two concurrent runs against one archive are not supported.
+- **Attachments are inline.** Messages are buffered whole in memory, and the
+  Gmail API caps a raw message at roughly 35 MB.
+- **Restore is secondary.** It is not exercised as heavily as backup, and
+  re-importing into an account that still holds the messages will duplicate
+  them — Gmail's import does not deduplicate server-side.
+- **`python-dotenv`, `tqdm`, `python-dateutil` and `pytest-mock` were declared
+  but never imported**, and have been dropped.

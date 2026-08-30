@@ -6,6 +6,7 @@ the IMAP backend produces the same on-disk format as the OAuth/API backend so
 the existing restore can read IMAP-made backups.
 """
 import base64
+import imaplib
 import json
 import os
 import shutil
@@ -34,7 +35,7 @@ INTERNALDATE = b"01-Jan-2024 12:00:00 +0000"
 
 METADATA_KEYS = {
     'message_id', 'thread_id', 'subject', 'from', 'to', 'date',
-    'labels', 'internal_date', 'size', 'backup_path', 'backup_time',
+    'labels', 'internal_date', 'size', 'sha256', 'backup_path', 'backup_time',
 }
 
 
@@ -79,14 +80,20 @@ def make_mailbox(messages):
         per_msg[uid] = _per_message_response(m)
 
     sweep_response = ('OK', sweep_lines if sweep_lines else [None])
+    search_response = ('OK', [b' '.join(str(m['uid']).encode() for m in messages)])
 
-    def fake_uid(command, arg, parts):
-        if arg == '1:*':
+    def fake_uid(command, arg, parts=None):
+        # The sweep is now UID SEARCH ALL followed by chunked UID FETCH of
+        # X-GM-MSGID only; bodies are fetched one UID at a time.
+        if command == 'SEARCH':
+            return search_response
+        if parts == '(X-GM-MSGID)':
             return sweep_response
         return per_msg.get(str(arg), ('NO', [None]))
 
     mailbox = MagicMock()
     mailbox.client.uid.side_effect = fake_uid
+    mailbox.client.untagged_responses = {'UIDVALIDITY': [b'1']}
     return mailbox
 
 
@@ -96,20 +103,29 @@ class ImapBackupTestBase(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.backup_dir = os.path.join(self.temp_dir, 'backup')
-        self.state_file = os.path.join(self.temp_dir, 'backup', 'backup_state.json')
+        self.db_path = os.path.join(self.temp_dir, 'backup', 'index.db')
+        self._backups = []
 
     def tearDown(self):
+        for backup in self._backups:
+            try:
+                backup.close()
+            except Exception:
+                pass
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
-    def make_backup(self, mailbox, folder='[Gmail]/All Mail'):
-        return ImapBackup(
+    def make_backup(self, mailbox, folder='[Gmail]/All Mail', **kwargs):
+        backup = ImapBackup(
             mailbox=mailbox,
             backup_dir=self.backup_dir,
-            state_file=self.state_file,
+            db_path=self.db_path,
             folder=folder,
             batch_size=10,
+            **kwargs,
         )
+        self._backups.append(backup)
+        return backup
 
 
 class TestImapBackupWritesFormat(ImapBackupTestBase):
@@ -160,7 +176,7 @@ class TestImapBackupWritesFormat(ImapBackupTestBase):
             self.assertEqual(f.read(), RAW_EMAIL)
 
         # State records the message under the same id.
-        self.assertTrue(backup.state.is_email_backed_up('100'))
+        self.assertTrue(backup.store.is_archived('100'))
 
     def test_selects_configured_folder_readonly(self):
         mailbox = make_mailbox([])
@@ -182,8 +198,8 @@ class TestImapBackupWritesFormat(ImapBackupTestBase):
         result = backup.backup_emails()
 
         self.assertEqual(result['total_processed'], 2)
-        self.assertTrue(backup.state.is_email_backed_up('100'))
-        self.assertTrue(backup.state.is_email_backed_up('101'))
+        self.assertTrue(backup.store.is_archived('100'))
+        self.assertTrue(backup.store.is_archived('101'))
 
 
 class TestImapBackupLabels(ImapBackupTestBase):
@@ -252,9 +268,10 @@ class TestImapBackupIncremental(ImapBackupTestBase):
         self.assertEqual(result2['total_errors'], 0)
 
         # The body was never fetched on the second run — only the cheap sweep.
-        fetched_args = [call.args[1] for call in mailbox2.client.uid.call_args_list]
-        self.assertTrue(fetched_args)  # the sweep happened
-        self.assertTrue(all(arg == '1:*' for arg in fetched_args))
+        calls = mailbox2.client.uid.call_args_list
+        self.assertTrue(calls)  # the sweep happened
+        body_fetches = [c for c in calls if 'BODY.PEEK[]' in str(c.args[-1])]
+        self.assertEqual(body_fetches, [], "re-run must not re-download bodies")
 
 
 class TestImapBackupEdgeCases(ImapBackupTestBase):
@@ -284,7 +301,7 @@ class TestImapBackupEdgeCases(ImapBackupTestBase):
         result = backup.backup_emails()
 
         self.assertEqual(result['total_processed'], 1)
-        self.assertTrue(backup.state.is_email_backed_up('<abc123@example.com>'))
+        self.assertTrue(backup.store.is_archived('<abc123@example.com>'))
 
 
 class TestImapBackupRestoreCompatibility(ImapBackupTestBase):
@@ -317,6 +334,99 @@ class TestImapBackupRestoreCompatibility(ImapBackupTestBase):
         body = mock_service.users().messages().import_.call_args.kwargs['body']
         self.assertEqual(base64.urlsafe_b64decode(body['raw']), RAW_EMAIL)
         self.assertEqual(body['labelIds'], ['INBOX', 'IMPORTANT', 'Work'])
+
+
+class TestImapBackupConnectionLoss(ImapBackupTestBase):
+    """A dropped connection must not be reported as a successful backup."""
+
+    def _dropping_mailbox(self, messages, drop_on_uid):
+        """A mailbox whose body FETCH raises IMAP4.abort for one UID."""
+        mailbox = make_mailbox(messages)
+        healthy = mailbox.client.uid.side_effect
+
+        def flaky(command, arg, parts=None):
+            if parts and 'BODY.PEEK[]' in str(parts) and str(arg) == drop_on_uid:
+                raise imaplib.IMAP4.abort('connection reset')
+            return healthy(command, arg, parts)
+
+        mailbox.client.uid.side_effect = flaky
+        return mailbox
+
+    def test_drop_without_reconnect_raises(self):
+        """With no way to recover, the run fails loudly instead of reporting 0 errors."""
+        mailbox = self._dropping_mailbox([
+            {'uid': '1', 'gm_msgid': '100', 'gm_thrid': '1',
+             'labels': b'\\Inbox', 'flags': b'\\Seen', 'raw': RAW_EMAIL},
+        ], drop_on_uid='1')
+        backup = self.make_backup(mailbox)
+
+        with self.assertRaises(imaplib.IMAP4.abort):
+            backup.backup_emails()
+
+    def test_reconnect_resumes_the_run(self):
+        """Given a reconnect callable, the message is retried and archived."""
+        messages = [{'uid': '1', 'gm_msgid': '100', 'gm_thrid': '1',
+                     'labels': b'\\Inbox', 'flags': b'\\Seen', 'raw': RAW_EMAIL}]
+        broken = self._dropping_mailbox(messages, drop_on_uid='1')
+        healthy = make_mailbox(messages)
+
+        backup = self.make_backup(broken, reconnect=lambda: healthy)
+        result = backup.backup_emails()
+
+        self.assertEqual(result['total_processed'], 1)
+        self.assertEqual(result['total_errors'], 0)
+        self.assertTrue(backup.store.is_archived('100'))
+
+    def test_progress_before_the_drop_is_kept(self):
+        """Messages archived before the connection died survive the failure."""
+        messages = [
+            {'uid': '1', 'gm_msgid': '100', 'gm_thrid': '1',
+             'labels': b'\\Inbox', 'flags': b'\\Seen', 'raw': RAW_EMAIL},
+            {'uid': '2', 'gm_msgid': '101', 'gm_thrid': '2',
+             'labels': b'\\Inbox', 'flags': b'\\Seen', 'raw': RAW_EMAIL},
+        ]
+        backup = self.make_backup(self._dropping_mailbox(messages, drop_on_uid='2'))
+
+        with self.assertRaises(imaplib.IMAP4.abort):
+            backup.backup_emails()
+
+        self.assertTrue(backup.store.is_archived('100'))
+
+
+class TestImapSweepChunking(ImapBackupTestBase):
+    """The sweep enumerates via SEARCH and fetches ids in bounded chunks."""
+
+    def test_uses_uid_search_not_open_ended_fetch(self):
+        mailbox = make_mailbox([
+            {'uid': '1', 'gm_msgid': '100', 'gm_thrid': '1',
+             'labels': b'\\Inbox', 'flags': b'\\Seen', 'raw': RAW_EMAIL},
+        ])
+        self.make_backup(mailbox).backup_emails()
+
+        commands = [c.args[0] for c in mailbox.client.uid.call_args_list]
+        self.assertIn('SEARCH', commands)
+        wildcard = [c for c in mailbox.client.uid.call_args_list if c.args[1] == '1:*']
+        self.assertEqual(wildcard, [], "sweep must not use an unbounded 1:* FETCH")
+
+    def test_sweep_failure_aborts_rather_than_under_reporting(self):
+        """A failed sweep chunk must not look like a smaller mailbox."""
+        mailbox = make_mailbox([
+            {'uid': '1', 'gm_msgid': '100', 'gm_thrid': '1',
+             'labels': b'\\Inbox', 'flags': b'\\Seen', 'raw': RAW_EMAIL},
+        ])
+
+        def failing(command, arg, parts=None):
+            if command == 'SEARCH':
+                return ('OK', [b'1'])
+            if parts == '(X-GM-MSGID)':
+                return ('NO', [None])
+            raise AssertionError('should not reach body fetch')
+
+        mailbox.client.uid.side_effect = failing
+        backup = self.make_backup(mailbox)
+
+        with self.assertRaises(IOError):
+            backup.backup_emails()
 
 
 if __name__ == '__main__':

@@ -112,7 +112,7 @@ class TestGmailRestoreState(unittest.TestCase):
         )
         
         # Modify state
-        restore.state['restored_message_ids'].append('msg123')
+        restore.state['restored_message_ids'].add('msg123')
         restore.state['total_restored'] = 1
         restore._save_state()
         
@@ -125,20 +125,23 @@ class TestGmailRestoreState(unittest.TestCase):
         self.assertIn('msg123', new_restore.state['restored_message_ids'])
         self.assertEqual(new_restore.state['total_restored'], 1)
     
-    def test_load_corrupted_state(self):
-        """Test loading corrupted state file returns default state."""
+    def test_load_corrupted_state_refuses_to_start(self):
+        """A corrupt restore state must not be treated as 'nothing restored yet'.
+
+        Silently starting fresh would re-import every message and duplicate the
+        user's whole mailbox, so this is a hard error the user has to resolve.
+        """
         state_file = os.path.join(self.backup_dir, 'restore_state.json')
         with open(state_file, 'w') as f:
             f.write("invalid json {{{")
-        
-        restore = GmailRestore(
-            gmail_service=self.mock_service,
-            backup_dir=self.backup_dir
-        )
-        
-        # Should have default state
-        self.assertEqual(restore.state['restored_message_ids'], [])
-        self.assertEqual(restore.state['total_restored'], 0)
+
+        with self.assertRaises(ValueError) as context:
+            GmailRestore(
+                gmail_service=self.mock_service,
+                backup_dir=self.backup_dir
+            )
+
+        self.assertIn('duplicate your mailbox', str(context.exception))
 
 
 class TestGmailRestoreImportEmail(unittest.TestCase):
@@ -317,7 +320,7 @@ class TestGmailRestoreProcessBatch(unittest.TestCase):
     def test_skips_already_restored_emails(self):
         """Test that already restored emails are skipped."""
         # Add to restored list
-        self.restore.state['restored_message_ids'].append('msg123')
+        self.restore.state['restored_message_ids'].add('msg123')
         
         # Create metadata file
         metadata = {

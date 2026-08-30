@@ -179,26 +179,56 @@ cython_debug/
 # Gmail Archiver specific
 *.log
 logs/
-*.eml
-!tests/test_emails/*.eml
 
+# ---------------------------------------------------------------------------
+# ARCHIVE CONTENTS — never commit mail or the index.
+# This repository is code only. The archive itself (messages, metadata sidecars
+# and the SQLite dedup index) lives outside the repo by default
+# (~/gmail-backup), but these patterns make it safe even if someone points
+# --backup-dir at a working copy.
+# ---------------------------------------------------------------------------
+*.eml
+emails/
+metadata/
+gmail-backup/
+backup/
+archive/
+
+# SQLite archive index (and its WAL sidecars)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+index.db*
+
+# Backup and restore state files, including migrated legacy state
+*_state.json
+*.json.migrated
+
+# Atomic-write temp files
+*.tmp
+
+# ---------------------------------------------------------------------------
 # Credentials and sensitive data
+# ---------------------------------------------------------------------------
 client_secrets.json
+credentials.json
+credentials*.json
+*client_secret*.json
 token.json
+*token*.json
+.gmail-archiver/
 *.pem
 *.key
 *.p12
 *.crt
 *.cert
 
-# Backup and restore state files
-*_state.json
-
 # Local development environment
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env
+.env.*
+!.env.example
 
 # IDE specific files
 .idea/
@@ -206,6 +236,10 @@ token.json
 *.swp
 *.swo
 *~
+
+# Agent / tooling local state
+.serena/
+.claude/settings.local.json
 
 # OS generated files
 .DS_Store
