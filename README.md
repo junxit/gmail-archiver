@@ -21,6 +21,7 @@ already have, and mail that disappears upstream is flagged, never removed.
 - [On-disk format](#on-disk-format)
 - [Deleted mail and tombstones](#deleted-mail-and-tombstones)
 - [Recovering from a lost index](#recovering-from-a-lost-index)
+- [Future iterations](#future-iterations)
 - [How to Test](#how-to-test)
 - [How to Delete / Uninstall](#how-to-delete--uninstall)
 - [Assumptions](#assumptions)
@@ -37,8 +38,9 @@ already have, and mail that disappears upstream is flagged, never removed.
 | **Self-healing** | Before skipping an indexed message, its file is checked on disk. A missing or truncated `.eml` is re-downloaded. |
 | **Preserves deleted mail** | Archived messages are never removed. When one disappears from Gmail it is flagged with a `vanished_at` timestamp. |
 | **Crash safety** | Every write is atomic (temp file → `fsync` → rename). An interrupted run costs only the messages it had not reached. |
-| **Read-only by default** | Backup requests `gmail.readonly` and selects IMAP folders read-only. It cannot alter or delete your mail. |
-| **Restore** | Optional, and authenticates separately with its own write-scoped token. |
+| **Read-only by default** | Backup selects IMAP folders read-only and fetches with `BODY.PEEK[]`; the OAuth path requests `gmail.readonly`. It cannot alter or delete your mail. |
+| **Backs up over IMAP** | An app password is all you need — no Google Cloud project. This is the default and the supported path; the API backend is [future work](#future-iterations). |
+| **Restore** | Secondary. Requires OAuth and authenticates separately with its own write-scoped token — see [Future iterations](#future-iterations). |
 
 ---
 
@@ -47,8 +49,8 @@ already have, and mail that disappears upstream is flagged, never removed.
 ```mermaid
 flowchart TD
     A[Start run] --> B{Auth method}
-    B -->|imap| C["UID SEARCH ALL<br/>over [Gmail]/All Mail"]
-    B -->|oauth / browser| D["messages.list<br/>full enumeration"]
+    B -->|"imap (default)"| C["UID SEARCH ALL<br/>over [Gmail]/All Mail"]
+    B -.->|"oauth / browser<br/>(future work)"| D["messages.list<br/>full enumeration"]
     C --> E["Cheap sweep:<br/>fetch X-GM-MSGID only"]
     D --> F[Message ids]
     E --> F
@@ -81,7 +83,7 @@ and flagging on that basis would mark the whole archive as vanished.
 | Operating system | macOS, Linux, or Windows |
 | Python | **3.10+** (developed and tested on 3.14) |
 | [`uv`](https://docs.astral.sh/uv/) | 0.5+ |
-| Gmail account | With either an app password (IMAP) or a Google Cloud OAuth client |
+| Gmail account | With an app password and IMAP enabled |
 
 External services: the Gmail IMAP endpoint (`imap.gmail.com:993`) or the Gmail
 API. No database server is required — the index is a local SQLite file.
@@ -114,63 +116,51 @@ uv run gmail-archiver --version
 
 ## Authentication
 
-Three methods. **IMAP with an app password is the recommended path** — it needs
-no Google Cloud project.
+**IMAP with a Gmail app password is the default and the supported path.** It
+needs no Google Cloud project, and it is the configuration this tool is built
+and tested around. The API-based methods exist in the code but are not the
+supported route yet — see [Future iterations](#future-iterations).
 
-### IMAP (app password)
+### IMAP app password — the supported path
 
 1. Enable 2-Step Verification on the Google account.
 2. Create an app password at <https://myaccount.google.com/apppasswords>.
 3. Enable IMAP in Gmail: Settings → Forwarding and POP/IMAP → Enable IMAP.
 
-Supply the password through the environment, never on the command line:
+Supply the credentials through the environment, never on the command line:
 
 ```bash
 export GMAIL_ARCHIVER_EMAIL='you@gmail.com'
 export GMAIL_ARCHIVER_APP_PASSWORD='xxxx xxxx xxxx xxxx'
+
+uv run gmail-archiver backup
 ```
 
 If neither the environment variable nor `--app-password` is set, the tool
-prompts interactively.
+prompts interactively. The app password is never written to disk.
 
 > `--app-password` still works but is deprecated: an argv value is readable by
 > any other user on the machine via `ps` and is written to your shell history.
 
-### OAuth (`--auth-method oauth`)
-
-Requires your own OAuth client from the Google Cloud Console (Desktop app type),
-downloaded as `client_secrets.json`. Backup requests only
-`https://www.googleapis.com/auth/gmail.readonly`.
-
-### Browser (`--auth-method browser`)
-
-The default, but it needs a `client_secrets.json` to be present. No OAuth client
-is bundled — publishing a real client secret in a repository would let anyone
-impersonate this application — so without one this method exits with
-instructions pointing at the other two.
-
 ### Where credentials are stored
+
+Only the OAuth paths persist anything:
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `~/.gmail-archiver/token.json` | Read-only backup token | `0600` in a `0700` directory |
+| `~/.gmail-archiver/token.json` | Read-only backup token (OAuth paths only) | `0600` in a `0700` directory |
 | `~/.gmail-archiver/token-restore.json` | Write-scoped restore token | `0600` in a `0700` directory |
-
-The app password is never written to disk.
 
 ---
 
 ## How to Run
 
 ```bash
-# Back up over IMAP (recommended)
-uv run gmail-archiver backup --auth-method imap
-
-# Back up via the Gmail API
-uv run gmail-archiver backup --auth-method oauth --client-secrets ~/client_secrets.json
+# Back up. IMAP is the default, so no --auth-method is needed.
+uv run gmail-archiver backup
 
 # Try it on a small slice first
-uv run gmail-archiver backup --auth-method imap --backup-dir /tmp/ga-test --max-results 50
+uv run gmail-archiver backup --backup-dir /tmp/ga-test --max-results 50
 
 # See what the archive holds
 uv run gmail-archiver status
@@ -179,8 +169,9 @@ uv run gmail-archiver status --list-vanished --list-failures
 # Rebuild the index from the archive itself
 uv run gmail-archiver rebuild-index
 
-# Restore into Gmail (authenticates separately; needs write access)
-uv run gmail-archiver restore
+# Restore into Gmail. Restore writes to the mailbox, which IMAP cannot do,
+# so it uses OAuth and authenticates separately from backup.
+uv run gmail-archiver restore --auth-method oauth --client-secrets ~/client_secrets.json
 ```
 
 Global options work either before or after the subcommand.
@@ -199,7 +190,7 @@ Global options work either before or after the subcommand.
 | Option | Default | Notes |
 |---|---|---|
 | `--backup-dir` | `~/gmail-backup` | Where the archive lives. |
-| `--auth-method` | `browser` | `oauth`, `browser`, or `imap`. |
+| `--auth-method` | `imap` | `imap` is the supported path. `oauth`/`browser` are future work. |
 | `--folder` | `[Gmail]/All Mail` | IMAP only. The name varies by account language. |
 | `--index-db` | `<backup-dir>/index.db` | SQLite index location. |
 | `--batch-size` | `100` | Messages between index commits. |
@@ -313,6 +304,45 @@ uv run gmail-archiver rebuild-index --backup-dir ~/gmail-backup
 An archive made by an older version with a `backup_state.json` is migrated
 automatically on first run; the old file is renamed to
 `backup_state.json.migrated`.
+
+---
+
+## Future iterations
+
+These paths exist in the code and are exercised by the test suite, but they are
+**not the supported route today**. Treat them as work in progress.
+
+### API-based backup (`--auth-method oauth` / `--auth-method browser`)
+
+The Gmail API backend is implemented and shares the same index, on-disk format,
+deduplication, self-healing and tombstone logic as the IMAP path. It is not the
+default because it asks more of you for no benefit at present:
+
+| Method | Status | Blocker |
+|---|---|---|
+| `--auth-method oauth` | Works, unsupported | Requires you to create a Google Cloud project and a Desktop OAuth client, then keep `client_secrets.json` around. |
+| `--auth-method browser` | **Not usable** | No OAuth client is bundled. Shipping a real client secret in a public repository would let anyone impersonate this application, so `BUNDLED_CLIENT_CONFIG` is deliberately left as placeholders. It exits with instructions rather than half-working. |
+
+What the API path would eventually buy, and why it may be worth finishing:
+
+- **`users.history.list`** for genuine incremental sync, including detection of
+  label changes on messages already archived — something IMAP cannot report.
+- **`includeSpamTrash=True`**, which would close the Trash/Spam gap described
+  under [Deleted mail and tombstones](#deleted-mail-and-tombstones) in a single
+  sweep rather than extra per-folder runs.
+- **Real label ids** (`Label_NNN`) instead of display names, which would make
+  user labels restore reliably.
+
+### Restore
+
+Restore is functional but secondary, and it is the one place OAuth is required
+today: Gmail offers no IMAP equivalent of `messages.import`. It authenticates
+separately from backup and stores its write-scoped token in its own file, so
+your day-to-day archiving credential never gains write access.
+
+```bash
+uv run gmail-archiver restore --auth-method oauth --client-secrets ~/client_secrets.json
+```
 
 ---
 

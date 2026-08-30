@@ -6,9 +6,15 @@ defaults when omitted.
 """
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from gmail_archiver.cli import parse_args, resolve_app_password
+from gmail_archiver.cli import (
+    EXIT_FAILURE,
+    _run_restore,
+    parse_args,
+    resolve_app_password,
+)
 
 
 class TestCliArgOrdering(unittest.TestCase):
@@ -59,7 +65,9 @@ class TestCliArgOrdering(unittest.TestCase):
 
     def test_defaults_when_omitted(self):
         args = parse_args(['backup'])
-        self.assertEqual(args.auth_method, 'browser')
+        # IMAP is the default: it is the supported backup path and the only one
+        # that works without the user creating a Google Cloud OAuth client.
+        self.assertEqual(args.auth_method, 'imap')
         self.assertEqual(args.backup_dir, '~/gmail-backup')
         self.assertEqual(args.folder, '[Gmail]/All Mail')
         self.assertEqual(args.imap_server, 'imap.gmail.com')
@@ -78,6 +86,10 @@ class TestCliArgOrdering(unittest.TestCase):
             self.assertEqual(args.backup_dir, '/tmp/b')
         # Restore has its own batch-size default (10).
         self.assertEqual(after.batch_size, 10)
+
+    def test_restore_defaults_to_imap_like_every_command(self):
+        """The shared default applies to restore too; _run_restore redirects it."""
+        self.assertEqual(parse_args(['restore']).auth_method, 'imap')
 
     def test_log_level_before_subcommand(self):
         args = parse_args(['--log-level', 'DEBUG', 'backup'])
@@ -123,6 +135,22 @@ class TestAppPasswordResolution(unittest.TestCase):
 
         with patch('gmail_archiver.cli.sys.stdin.isatty', return_value=False):
             self.assertIsNone(resolve_app_password(args))
+
+
+class TestRestoreRejectsImap(unittest.TestCase):
+    """Restore writes to the mailbox, which Gmail's IMAP cannot do."""
+
+    def test_imap_restore_fails_with_actionable_message(self):
+        """Now that imap is the default, the error must name the fix."""
+        args = parse_args(['restore'])
+
+        with patch('gmail_archiver.cli.logger') as mock_logger:
+            code = _run_restore(args, Path('/tmp/does-not-matter'))
+
+        self.assertEqual(code, EXIT_FAILURE)
+        message = mock_logger.error.call_args[0][0]
+        self.assertIn('--auth-method oauth', message)
+        self.assertIn('Gmail API', message)
 
 
 if __name__ == '__main__':

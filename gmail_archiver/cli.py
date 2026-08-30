@@ -74,13 +74,18 @@ def _add_shared_arguments(target, use_suppress_defaults=False):
     auth_group = target.add_argument_group('Authentication')
     auth_group.add_argument(
         '--auth-method',
-        choices=['oauth', 'browser', 'imap'],
-        default=default('browser'),
-        help='Authentication method: oauth (requires client_secrets.json), '
-             'browser (opens browser for Google login), or imap (uses app password).'
+        choices=['imap', 'oauth', 'browser'],
+        default=default('imap'),
+        help='Authentication method. "imap" (default) uses a Gmail app '
+             'password and is the supported path for backup. "oauth" requires '
+             'your own client_secrets.json and is currently needed only for '
+             'restore. "browser" is not usable yet - no OAuth client is '
+             'bundled. See README.'
     )
 
-    oauth_group = target.add_argument_group('OAuth Authentication')
+    oauth_group = target.add_argument_group(
+        'OAuth Authentication (restore, and future API-based backup)'
+    )
     oauth_group.add_argument(
         '--client-secrets',
         type=str,
@@ -141,12 +146,11 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Back up over IMAP with an app password (password read from the environment)
+  # Back up. IMAP with an app password is the default and supported path;
+  # credentials are read from the environment.
+  export GMAIL_ARCHIVER_EMAIL='you@gmail.com'
   export GMAIL_ARCHIVER_APP_PASSWORD='xxxx xxxx xxxx xxxx'
-  gmail-archiver backup --auth-method imap --email you@gmail.com
-
-  # Backup using OAuth with your own Google Cloud credentials
-  gmail-archiver backup --auth-method oauth --client-secrets ~/client_secrets.json
+  gmail-archiver backup
 
   # Show what the archive currently holds
   gmail-archiver status --backup-dir ~/gmail-backup
@@ -154,8 +158,12 @@ Examples:
   # Rebuild the dedup index from the archive itself
   gmail-archiver rebuild-index --backup-dir ~/gmail-backup
 
-  # Restore emails from backup (authenticates separately; needs write access)
-  gmail-archiver restore --backup-dir ~/gmail-backup
+  # Restore into Gmail. Restore needs write access, so it uses OAuth and
+  # authenticates separately from backup.
+  gmail-archiver restore --auth-method oauth --backup-dir ~/gmail-backup
+
+API-based backup (--auth-method oauth/browser) works but is not the
+supported path yet; see "Future iterations" in the README.
 """
     )
 
@@ -503,7 +511,14 @@ def _run_backup(args, backup_dir: Path) -> int:
 def _run_restore(args, backup_dir: Path) -> int:
     """Run a restore and return the process exit code."""
     if args.auth_method == 'imap':
-        logger.error("IMAP is supported for backup only. Please use oauth or browser for restore.")
+        # IMAP is the default because it is the supported *backup* path, but
+        # restore writes to the mailbox and Gmail offers no IMAP equivalent of
+        # messages.import, so it needs OAuth. Say so rather than failing vaguely.
+        logger.error(
+            "Restore cannot use IMAP - importing messages requires the Gmail API. "
+            "Re-run with: gmail-archiver restore --auth-method oauth "
+            "--client-secrets <your client_secrets.json>"
+        )
         return EXIT_FAILURE
 
     # Restore writes to the mailbox, so it consents separately and stores its
