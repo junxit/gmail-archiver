@@ -43,7 +43,7 @@ dependencies = [
     "protobuf>=6.33.5",     # CVE-2026-0994 JSON recursion depth bypass
     "pyasn1>=0.6.4",        # CVE-2026-30922/59884/59885/59886 decoder DoS
     "requests>=2.33.0",     # CVE-2026-25645 insecure temp file reuse
-    "urllib3>=2.7.0",       # CVE-2026-44431 cross-origin header leak, -44432 bomb
+    "urllib3>=2.8.0",       # CVE-2026-44431 cross-origin header leak, -44432 bomb
 ]
 
 [project.optional-dependencies]
