@@ -29,18 +29,18 @@ classifiers = [
 
 dependencies = [
     # Direct imports.
-    "google-api-python-client>=2.199.0",
-    "google-auth-oauthlib>=1.4.1",
-    "google-auth>=2.57.0",
+    "google-api-python-client>=2.201.0",
+    "google-auth-oauthlib>=1.5.0",
+    "google-auth>=2.62.0",
     # imap_backup.py relies on 1.x behavior and the imap_tools.imap_utf7 module;
     # the old >=0.39 floor allowed resolving a 0.x release that breaks it.
-    "imap-tools>=1.11,<2",
+    "imap-tools>=1.16.0,<2",
 
     # Transitive pins for published advisories. These arrive via the Google
     # client libraries, which do not floor them high enough on their own.
     "httplib2>=0.32.0",     # CVE-2026-59939 gzip/deflate decompression bomb
-    "idna>=3.15",           # CVE-2026-45409 idna.encode() bypass
-    "protobuf>=6.33.5",     # CVE-2026-0994 JSON recursion depth bypass
+    "idna>=3.20",           # CVE-2026-45409 idna.encode() bypass
+    "protobuf>=7.36.2",     # CVE-2026-0994 JSON recursion depth bypass
     "pyasn1>=0.6.4",        # CVE-2026-30922/59884/59885/59886 decoder DoS
     "requests>=2.33.0",     # CVE-2026-25645 insecure temp file reuse
     "urllib3>=2.8.0",       # GHSA-8988-9cw3-xx77 proxy TLS config ignored,
